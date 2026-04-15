@@ -160,6 +160,11 @@ export default function App() {
         for (const result of reserveResults) {
           if (result.status !== 'fulfilled') continue
           for (const r of result.value) {
+            // Skip tiny reserves (< $1M supply) — they skew utilization to 100%
+            // due to rounding on low-liquidity assets and aren't relevant to
+            // protocol-wide withdrawal risk
+            const supplyUsd = Number(r.totalSupplyUsd ?? 0)
+            if (supplyUsd < 1_000_000) continue
             const u = extractUtilization(r)
             if (u > maxUtil) maxUtil = u
           }

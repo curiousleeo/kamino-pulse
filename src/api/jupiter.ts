@@ -29,12 +29,13 @@ export async function fetchJupiterPrices(): Promise<JupiterPrice[]> {
 
   const res = await fetch(`${BASE}/price/v3?ids=${mints.join(',')}`, { headers })
   if (!res.ok) throw new Error(`Jupiter ${res.status}`)
-  const data = await res.json()
+  // Jupiter /price/v3 returns { mintAddress: { usdPrice: number, ... } }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const data: Record<string, any> = await res.json()
 
   return mints.map(mint => ({
     symbol: symbolByMint[mint] || mint,
     mint,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    price: data.data?.[mint]?.price != null ? Number(data.data[mint].price) : null,
+    price: data[mint]?.usdPrice != null ? Number(data[mint].usdPrice) : null,
   }))
 }

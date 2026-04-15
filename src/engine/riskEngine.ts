@@ -165,29 +165,31 @@ export function scoreAssetRisk(p: {
     })
   }
 
-  // LST/SOL ratio — LSTs should always trade at a premium to SOL (staking rewards)
+  // LST/SOL ratio — LSTs accumulate staking rewards so their ratio to SOL grows over time.
+  // A ratio of 1.30+ is normal for LSTs that have been running for years.
+  // We only flag a DISCOUNT (ratio dropping below expected), not the absolute level.
   const lsts = ['jitoSOL', 'mSOL', 'bSOL']
   for (const sym of lsts) {
     const lstPrice = prices[sym]
     if (!lstPrice || !solPrice) {
-      signals.push({ label: `${sym}/SOL`, value: 'N/A', status: 'yellow', detail: 'Price unavailable' })
+      // Don't penalise missing prices — just skip silently with green
+      signals.push({ label: `${sym}/SOL`, value: 'N/A', status: 'green', detail: 'Price data unavailable — not flagging' })
       continue
     }
     const ratio = lstPrice / solPrice
-    // Ratio should be > 1.0 (premium). Flag if trading at discount.
-    const discount = 1 - ratio
+    // Only flag if the LST is trading BELOW SOL (genuine depeg)
+    // Normal accumulated exchange rate can be 1.05 to 1.40+ depending on LST age
     signals.push({
-      label: `${sym}/SOL Ratio`,
-      value: ratio.toFixed(4),
+      label: `${sym}/SOL`,
+      value: `${ratio.toFixed(4)}x`,
       status:
-        ratio < 0.95 ? 'red'
-        : ratio < 0.97 ? 'orange'
-        : ratio < 0.99 ? 'yellow'
+        ratio < 0.97 ? 'red'
+        : ratio < 0.99 ? 'orange'
         : 'green',
       detail:
         ratio < 0.99
-          ? `Trading at discount to SOL — depeg risk (${pct(discount)} below)`
-          : `Premium of ${pct(ratio - 1)} over SOL — healthy`,
+          ? `Trading at a discount to SOL — possible depeg event`
+          : `${ratio.toFixed(3)}x SOL — includes accumulated staking yield, healthy`,
     })
   }
 
