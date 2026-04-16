@@ -1,12 +1,14 @@
 const API_KEY = import.meta.env.VITE_HELIUS_API_KEY || ''
 const RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${API_KEY}`
 
-// Fallback public RPC if no Helius key
-const PUBLIC_RPC = 'https://api.mainnet-beta.solana.com'
+// Multiple public fallback RPCs — tried in parallel, first successful wins
+const PUBLIC_RPCS = [
+  'https://api.mainnet-beta.solana.com',
+  'https://rpc.ankr.com/solana',
+]
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function rpc(method: string, params: unknown[] = []): Promise<any> {
-  const url = API_KEY ? RPC_URL : PUBLIC_RPC
+async function rpcOnce(url: string, method: string, params: unknown[]): Promise<any> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -16,6 +18,17 @@ async function rpc(method: string, params: unknown[] = []): Promise<any> {
   const data = await res.json()
   if (data.error) throw new Error(`RPC: ${data.error.message}`)
   return data.result
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function rpc(method: string, params: unknown[] = []): Promise<any> {
+  if (API_KEY) return rpcOnce(RPC_URL, method, params)
+  // No API key — try public RPCs sequentially, return first successful result
+  let lastErr: unknown
+  for (const url of PUBLIC_RPCS) {
+    try { return await rpcOnce(url, method, params) } catch (e) { lastErr = e }
+  }
+  throw lastErr
 }
 
 // ─── Base58 decode (no external dep) ─────────────────────────────────────────
@@ -62,14 +75,42 @@ function base58Encode(bytes: Uint8Array): string {
 const KVAULT_TOKEN_MINT_OFFSET   = 80
 const KVAULT_RESERVE_PUBKEY_OFFSET = 312
 
+// Hardcoded fallback for known vaults — vault-to-reserve relationships are
+// permanent on-chain. Used when the RPC call fails (rate limit on public endpoint).
+// Add entries as new vaults are decoded.
+const KNOWN_VAULT_TOKEN_INFO: Record<string, { tokenMint: string; reservePubkey: string }> = {
+  // Sentora PYUSD Vault → Main Market PYUSD reserve
+  'A2wsxhA7pF4B2UKVfXocb6TAAP9ipfPJam6oMKgDE5BK': {
+    tokenMint:    '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo',
+    reservePubkey: '2gc9Dm1eB6UgVYFBUN9bWks6Kes9PbWSaPaa9DqyvEiN',
+  },
+}
+
+// Module-level cache: once we decode a vault's on-chain data, store it
+// so subsequent refreshes don't need to re-hit the RPC endpoint
+const vaultTokenInfoCache = new Map<string, { tokenMint: string; reservePubkey: string }>()
+
 /**
  * Reads the K-Vault program account on-chain and extracts the underlying
  * token mint and lending reserve pubkey from their fixed struct offsets.
+ * Results are cached in memory so the RPC is only hit once per vault per session.
  * Returns null if the account cannot be read or is too small.
  */
 export async function fetchVaultTokenInfo(
   vaultAddress: string
 ): Promise<{ tokenMint: string; reservePubkey: string } | null> {
+  // 1. In-memory cache (populated on first successful decode)
+  const cached = vaultTokenInfoCache.get(vaultAddress)
+  if (cached) return cached
+
+  // 2. Hardcoded map for known vaults (works even without RPC)
+  const known = KNOWN_VAULT_TOKEN_INFO[vaultAddress]
+  if (known) {
+    vaultTokenInfoCache.set(vaultAddress, known)
+    return known
+  }
+
+  // 3. On-chain decode via RPC (falls back across public endpoints)
   try {
     const result = await rpc('getAccountInfo', [vaultAddress, { encoding: 'base64' }])
     if (!result?.value?.data) return null
@@ -77,13 +118,15 @@ export async function fetchVaultTokenInfo(
     const raw = Uint8Array.from(atob(result.value.data[0]), c => c.charCodeAt(0))
     if (raw.length < KVAULT_RESERVE_PUBKEY_OFFSET + 32) return null
 
-    const tokenMintBytes    = raw.slice(KVAULT_TOKEN_MINT_OFFSET, KVAULT_TOKEN_MINT_OFFSET + 32)
+    const tokenMintBytes     = raw.slice(KVAULT_TOKEN_MINT_OFFSET, KVAULT_TOKEN_MINT_OFFSET + 32)
     const reservePubkeyBytes = raw.slice(KVAULT_RESERVE_PUBKEY_OFFSET, KVAULT_RESERVE_PUBKEY_OFFSET + 32)
 
-    return {
+    const info = {
       tokenMint:    base58Encode(tokenMintBytes),
       reservePubkey: base58Encode(reservePubkeyBytes),
     }
+    vaultTokenInfoCache.set(vaultAddress, info)
+    return info
   } catch {
     return null
   }

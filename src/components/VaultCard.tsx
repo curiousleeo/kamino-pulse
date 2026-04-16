@@ -1,9 +1,8 @@
-import type { KaminoVaultPosition, ReserveRegistry } from '../api/kamino'
+import type { KaminoVaultPosition } from '../api/kamino'
 
 interface Props {
   position: KaminoVaultPosition
   index: number
-  registry?: ReserveRegistry
 }
 
 function fmtUsd(n: number): string {
@@ -13,14 +12,7 @@ function fmtUsd(n: number): string {
   return `$${n.toFixed(2)}`
 }
 
-function utilizationColor(u: number): string {
-  if (u >= 0.92) return '#ef4444'
-  if (u >= 0.82) return '#f97316'
-  if (u >= 0.72) return '#f59e0b'
-  return '#10b981'
-}
-
-export function VaultCard({ position, index, registry }: Props) {
+export function VaultCard({ position, index }: Props) {
   const addr        = position.vaultAddress || ''
   const shortAddr   = addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : `Vault ${index + 1}`
   const tokenSymbol = position.tokenSymbol ?? null
@@ -31,6 +23,14 @@ export function VaultCard({ position, index, registry }: Props) {
   const sharePrice  = position.sharePrice ?? null
   const holders     = position.numberOfHolders ?? 0
 
+  // Vault TVL — total capital deployed by this vault into the lending protocol
+  const vaultTvl        = position.vaultTvlUsd ?? 0
+  // Available = idle buffer in the vault (not yet deployed, or freed from reserve)
+  const availableUsd    = position.tokensAvailableUsd ?? 0
+  // Deploy ratio — what % of vault TVL is deployed vs sitting idle
+  const deployedRatio   = vaultTvl > 0 ? Math.min((vaultTvl - availableUsd) / vaultTvl, 1) : 0
+  const availablePct    = vaultTvl > 0 ? ((availableUsd / vaultTvl) * 100).toFixed(1) : null
+
   // Yield — current live rate (apy = current, NOT 7d average)
   const apyBase  = position.apy ?? 0
   const apyFarm  = position.apyFarmRewards ?? 0
@@ -39,15 +39,6 @@ export function VaultCard({ position, index, registry }: Props) {
   // Estimated earnings from user's position
   const earnPerYear = value * apyTotal
   const earnPerDay  = earnPerYear / 365
-
-  // Reserve-level stats — sourced from vault metrics API or registry fallback
-  // Priority: position fields (set in fetchUserVaultPositions) → registry
-  const reserveInfo     = registry && position.reservePubkey ? registry[position.reservePubkey] : undefined
-  const totalSupplyUsd  = position.reserveTotalSupplyUsd || reserveInfo?.totalSupplyUsd || 0
-  const totalBorrowUsd  = position.reserveTotalBorrowUsd || reserveInfo?.totalBorrowUsd || 0
-  const reserveUtil     = position.reserveUtilization    || reserveInfo?.utilization    || 0
-  const availableUsd    = totalSupplyUsd > 0 ? totalSupplyUsd * (1 - reserveUtil) : 0
-  const utilColor       = utilizationColor(reserveUtil)
 
   // Stablecoin peg deviation
   const pegDeviation = tokenType === 'stablecoin' && tokenPrice
@@ -120,85 +111,49 @@ export function VaultCard({ position, index, registry }: Props) {
           <p className="text-[10px] font-bold tracking-[0.18em] text-slate-700 uppercase mb-3">Vault Stats</p>
           <div className="space-y-3">
 
-            {/* Total Supply / Total Borrowed side by side */}
+            {/* Vault TVL + Available side by side */}
             <div className="grid grid-cols-2 gap-3">
               <div
                 className="rounded-xl px-4 py-3"
                 style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
               >
-                <p className="text-[10px] text-slate-600 mb-1">Total Supply</p>
+                <p className="text-[10px] text-slate-600 mb-1">Vault TVL</p>
                 <p className="text-base font-black text-slate-200">
-                  {totalSupplyUsd > 0 ? fmtUsd(totalSupplyUsd) : '—'}
+                  {vaultTvl > 0 ? fmtUsd(vaultTvl) : '—'}
                 </p>
-              </div>
-              <div
-                className="rounded-xl px-4 py-3"
-                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
-              >
-                <p className="text-[10px] text-slate-600 mb-1">Total Borrowed</p>
-                <p className="text-base font-black text-slate-200">
-                  {totalBorrowUsd > 0 ? fmtUsd(totalBorrowUsd) : '—'}
-                </p>
-              </div>
-            </div>
-
-            {/* Utilization bar */}
-            {reserveUtil > 0 ? (
-              <div
-                className="rounded-xl px-4 py-3 space-y-2"
-                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="text-[10px] text-slate-600">Utilization</p>
-                  <span className="text-sm font-black font-mono" style={{ color: utilColor }}>
-                    {(reserveUtil * 100).toFixed(1)}%
-                  </span>
-                </div>
-                <div className="h-1.5 rounded-full overflow-hidden" style={{ background: '#1a1f2e' }}>
-                  <div
-                    className="h-full rounded-full"
-                    style={{ width: `${Math.min(reserveUtil * 100, 100)}%`, background: utilColor }}
-                  />
-                </div>
-              </div>
-            ) : (
-              <div
-                className="rounded-xl px-4 py-3"
-                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
-              >
-                <p className="text-[10px] text-slate-600 mb-1">Utilization</p>
-                <p className="text-sm text-slate-600">Loading…</p>
-              </div>
-            )}
-
-            {/* Available to withdraw + Total Users side by side */}
-            <div className="grid grid-cols-2 gap-3">
-              <div
-                className="rounded-xl px-4 py-3"
-                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
-              >
-                <p className="text-[10px] text-slate-600 mb-1">Available to Withdraw</p>
-                <p
-                  className="text-base font-black"
-                  style={{ color: reserveUtil >= 0.92 ? '#ef4444' : reserveUtil >= 0.82 ? '#f97316' : '#34d399' }}
-                >
-                  {availableUsd > 0 ? fmtUsd(availableUsd) : '—'}
-                </p>
-                {reserveUtil > 0 && (
-                  <p className="text-[10px] text-slate-700 mt-0.5">{(100 - reserveUtil * 100).toFixed(1)}% free</p>
+                {vaultTvl > 0 && (
+                  <p className="text-[10px] text-slate-700 mt-0.5">total deployed</p>
                 )}
               </div>
               <div
                 className="rounded-xl px-4 py-3"
                 style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
               >
-                <p className="text-[10px] text-slate-600 mb-1">Total Users</p>
-                <p className="text-base font-black text-slate-200">
-                  {holders > 0 ? holders.toLocaleString() : '—'}
+                <p className="text-[10px] text-slate-600 mb-1">Available</p>
+                <p
+                  className="text-base font-black"
+                  style={{ color: availableUsd > 100 ? '#34d399' : '#f97316' }}
+                >
+                  {availableUsd > 0 ? fmtUsd(availableUsd) : '—'}
                 </p>
-                {holders > 0 && <p className="text-[10px] text-slate-700 mt-0.5">depositors</p>}
+                {availablePct !== null && (
+                  <p className="text-[10px] text-slate-700 mt-0.5">{availablePct}% of TVL</p>
+                )}
               </div>
             </div>
+
+            {/* Total Users */}
+            <div
+              className="rounded-xl px-4 py-3"
+              style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
+            >
+              <p className="text-[10px] text-slate-600 mb-1">Total Users</p>
+              <p className="text-base font-black text-slate-200">
+                {holders > 0 ? holders.toLocaleString() : '—'}
+              </p>
+              {holders > 0 && <p className="text-[10px] text-slate-700 mt-0.5">depositors</p>}
+            </div>
+
           </div>
         </div>
 

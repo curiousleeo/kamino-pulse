@@ -594,7 +594,7 @@ export default function App() {
             })}
 
             {activeVaults.map((vault, i) => (
-              <VaultCard key={vault.vaultAddress || i} position={vault} index={i} registry={registry} />
+              <VaultCard key={vault.vaultAddress || i} position={vault} index={i} />
             ))}
           </div>
         )}

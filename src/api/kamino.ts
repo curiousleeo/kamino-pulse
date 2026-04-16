@@ -149,12 +149,14 @@ export interface KaminoVaultPosition {
   tokensAvailable?: number     // tokens in vault buffer available to withdraw NOW
   tokensAvailableUsd?: number
   tokensInvested?: number      // tokens deployed into lending market
+  vaultTvlUsd?: number         // vault total TVL = tokensInvestedUsd (vault-level stat)
   apy?: number                 // current base APY (0–1)
   apy7d?: number               // 7-day APY
   apy30d?: number              // 30-day APY
   apyFarmRewards?: number      // additional farm/incentive rewards APY
   numberOfHolders?: number
-  // Reserve-level stats (from vault metrics API or registry)
+  // Reserve-level stats (from vault metrics API or registry) — NOT shown in VaultCard,
+  // used only by the risk engine for protocol-level utilization analysis
   reserveTotalSupplyUsd?: number
   reserveTotalBorrowUsd?: number
   reserveUtilization?: number  // 0–1
@@ -407,9 +409,10 @@ async function fetchVaultMetrics(vaultAddress: string): Promise<VaultMetrics> {
       : tokenPrice > 0 ? 'volatile'
       : 'unknown'
 
-    // Try every field name the API might use for reserve-level supply/borrow
+    // tokensInvestedUsd = total vault capital deployed to the lending reserve
+    // This IS the vault's total supply in USD — confirmed from API response inspection
     const totalSupplyUsd = Number(
-      d.totalSupplyUsd ?? d.totalDeposited ?? d.totalSupplied ?? d.tvl ?? 0
+      d.tokensInvestedUsd ?? d.totalSupplyUsd ?? d.totalDeposited ?? d.totalSupplied ?? d.tvl ?? 0
     )
     const totalBorrowUsd = Number(
       d.totalBorrowUsd ?? d.totalBorrowed ?? d.totalBorrows ?? d.totalDebt ?? 0
@@ -524,6 +527,8 @@ export async function fetchUserVaultPositions(
         tokensAvailable:      metrics.tokensAvailable,
         tokensAvailableUsd:   metrics.tokensAvailableUsd,
         tokensInvested:       metrics.tokensInvested,
+        // vaultTvlUsd: total capital deployed by this vault into lending (vault-level stat)
+        vaultTvlUsd:          metrics.totalSupplyUsd,
         apy:                  metrics.apy,
         apy7d:                metrics.apy7d,
         apy30d:               metrics.apy30d,
