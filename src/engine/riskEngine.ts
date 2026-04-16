@@ -144,9 +144,11 @@ export function scoreAssetRisk(p: {
   prices: Record<string, number | null>
 }): RiskLayer {
   const signals: RiskSignal[] = []
-  const { prices, solPrice } = p
+  const { prices } = p
 
-  // Stablecoin peg deviation
+  // Stablecoin peg deviation — USDC and USDT use traditional reserve-backed pegs
+  // Price band rejects any oracle price outside ±1% automatically, but we surface
+  // smaller deviations so users can react before the circuit breaker fires
   for (const sym of ['USDC', 'USDT']) {
     const price = prices[sym]
     if (price === null || price === undefined) {
@@ -160,43 +162,27 @@ export function scoreAssetRisk(p: {
       status: thresh(dev, [[0.01, 'red'], [0.005, 'orange'], [0.003, 'yellow']]),
       detail:
         dev >= 0.003
-          ? `Deviating ${pct(dev)} from $1.00 — depeg in progress`
+          ? `${pct(dev)} deviation from $1.00 — depeg in progress`
           : 'Holding peg',
     })
   }
 
-  // LST/SOL ratio — LSTs accumulate staking rewards so their ratio to SOL grows over time.
-  // A ratio of 1.30+ is normal for LSTs that have been running for years.
-  // We only flag a DISCOUNT (ratio dropping below expected), not the absolute level.
-  const lsts = ['jitoSOL', 'mSOL', 'bSOL']
-  for (const sym of lsts) {
-    const lstPrice = prices[sym]
-    if (!lstPrice || !solPrice) {
-      // Don't penalise missing prices — just skip silently with green
-      signals.push({ label: `${sym}/SOL`, value: 'N/A', status: 'green', detail: 'Price data unavailable — not flagging' })
-      continue
-    }
-    const ratio = lstPrice / solPrice
-    // Only flag if the LST is trading BELOW SOL (genuine depeg)
-    // Normal accumulated exchange rate can be 1.05 to 1.40+ depending on LST age
-    signals.push({
-      label: `${sym}/SOL`,
-      value: `${ratio.toFixed(4)}x`,
-      status:
-        ratio < 0.97 ? 'red'
-        : ratio < 0.99 ? 'orange'
-        : 'green',
-      detail:
-        ratio < 0.99
-          ? `Trading at a discount to SOL — possible depeg event`
-          : `${ratio.toFixed(3)}x SOL — includes accumulated staking yield, healthy`,
-    })
-  }
+  // LST oracle note — Kamino prices jitoSOL / mSOL / bSOL using the on-chain
+  // stake-pool exchange rate (SOL_staked / LST_minted), NOT DEX spot price.
+  // A DEX depeg of 5% has zero effect on positions. We do NOT flag DEX depegs.
+  // The only real LST risk is a stake-pool smart contract exploit, which would
+  // require a separate incident response — no oracle signal can predict it.
+  signals.push({
+    label: 'LST Oracle Method',
+    value: 'Stake-pool rate',
+    status: 'green',
+    detail: 'jitoSOL / mSOL / bSOL priced by on-chain stake pool — DEX price moves cannot trigger Kamino liquidations',
+  })
 
   return {
     id: 'asset',
     name: 'Asset Risk',
-    description: 'Stablecoin peg deviation and LST discount / depeg monitoring',
+    description: 'Stablecoin peg deviation · LST oracle method',
     tier: worst(signals.map(s => s.status)),
     signals,
   }

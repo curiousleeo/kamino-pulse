@@ -1,9 +1,11 @@
 import { HealthBar } from './HealthBar'
-import type { KaminoObligation } from '../api/kamino'
+import type { KaminoObligation, ReserveInfo } from '../api/kamino'
 
 interface Props {
   obligation: KaminoObligation
   index: number
+  // Reserve data for the tokens in this position (keyed by reserve pubkey or symbol)
+  reservesBySymbol?: Record<string, ReserveInfo>
 }
 
 function fmt(n: number | null): string {
@@ -15,9 +17,28 @@ function fmt(n: number | null): string {
   return `$${n.toFixed(2)}`
 }
 
-export function ObligationCard({ obligation, index }: Props) {
+function pct(n: number, dp = 1): string {
+  return `${(n * 100).toFixed(dp)}%`
+}
+
+// Maps market key to a readable short label for the badge
+function marketLabel(marketName: string): string {
+  if (marketName.includes('Jito'))     return 'JITO 10×'
+  if (marketName.includes('Marinade')) return 'MARINADE 10×'
+  if (marketName.includes('JLP'))      return 'JLP MARKET'
+  if (marketName.includes('Altcoin'))  return 'ALTCOINS'
+  if (marketName.includes('Bitcoin'))  return 'BITCOIN'
+  if (marketName.includes('Main'))     return 'MAIN MARKET'
+  if (marketName.includes('INF'))      return 'INF/SOL'
+  if (marketName.includes('bSOL') || marketName.includes('Solblaze')) return 'bSOL/SOL'
+  return marketName.toUpperCase().slice(0, 12)
+}
+
+export function ObligationCard({ obligation, index, reservesBySymbol }: Props) {
   const stats = obligation.refreshedStats
   const tag = obligation.humanTag || `Position ${index + 1}`
+  const isCorrelated = obligation.isCorrelated ?? false
+  const marketName = obligation.marketName ?? 'Unknown Market'
 
   let hf: number | null = null
   let deposited: number | null = null
@@ -43,6 +64,44 @@ export function ObligationCard({ obligation, index }: Props) {
 
   const hasBorrow = borrowed !== null && borrowed > 1
 
+  // ── For correlated (LST/SOL eMode) positions: compute rate spread ───────────
+  // The only risk is borrow rate > staking yield — price can't trigger liquidation
+  let stakingYield: number | null = null
+  let borrowRate: number | null = null
+  let rateSpread: number | null = null
+
+  if (isCorrelated && reservesBySymbol) {
+    // Try to find the collateral LST reserve (jitoSOL, mSOL, bSOL, INF)
+    const lstSymbols = ['jitoSOL', 'mSOL', 'bSOL', 'INF', 'rstSOL', 'bbSOL']
+    for (const sym of lstSymbols) {
+      const r = reservesBySymbol[sym]
+      if (r) {
+        stakingYield = r.supplyApy   // proxy for staking yield via lending
+        borrowRate   = r.borrowApy
+        rateSpread   = stakingYield - borrowRate
+        break
+      }
+    }
+    // Also try SOL reserve for borrow rate
+    if (!borrowRate) {
+      const solR = reservesBySymbol['SOL']
+      if (solR) borrowRate = solR.borrowApy
+    }
+  }
+
+  // ── Badge styling ─────────────────────────────────────────────────────────
+  const positionType = isCorrelated
+    ? 'RATE-RISK ONLY'
+    : hasBorrow
+    ? 'LENDING + BORROW'
+    : 'EARN ONLY'
+
+  const badgeStyle = isCorrelated
+    ? { color: '#818cf8', background: 'rgba(99,102,241,0.1)', borderColor: 'rgba(99,102,241,0.2)' }
+    : hasBorrow
+    ? { color: '#f59e0b', background: 'rgba(245,158,11,0.1)', borderColor: 'rgba(245,158,11,0.2)' }
+    : { color: '#10b981', background: 'rgba(16,185,129,0.1)', borderColor: 'rgba(16,185,129,0.2)' }
+
   return (
     <div
       className="rounded-2xl overflow-hidden transition-all duration-200"
@@ -57,30 +116,28 @@ export function ObligationCard({ obligation, index }: Props) {
         className="px-6 pt-6 pb-5"
         style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}
       >
-        <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
           <div>
-            <p className="text-[10px] font-bold tracking-[0.2em] text-slate-700 uppercase mb-1.5">
-              Lending Position
-            </p>
+            {/* Market badge */}
+            <div className="flex items-center gap-2 mb-1.5">
+              <span
+                className="text-[9px] font-bold tracking-[0.18em] px-2 py-0.5 rounded-md"
+                style={{
+                  color: '#64748b',
+                  background: 'rgba(100,116,139,0.08)',
+                  border: '1px solid rgba(100,116,139,0.12)',
+                }}
+              >
+                {marketLabel(marketName)}
+              </span>
+            </div>
             <h3 className="text-slate-100 font-bold text-lg leading-tight">{tag}</h3>
           </div>
           <span
             className="flex-shrink-0 mt-1 text-[10px] font-bold tracking-wider px-3 py-1 rounded-full border"
-            style={
-              hasBorrow
-                ? {
-                    color: '#f59e0b',
-                    background: 'rgba(245,158,11,0.1)',
-                    borderColor: 'rgba(245,158,11,0.2)',
-                  }
-                : {
-                    color: '#10b981',
-                    background: 'rgba(16,185,129,0.1)',
-                    borderColor: 'rgba(16,185,129,0.2)',
-                  }
-            }
+            style={badgeStyle}
           >
-            {hasBorrow ? 'LENDING + BORROWING' : 'LEND ONLY'}
+            {positionType}
           </span>
         </div>
       </div>
@@ -116,8 +173,53 @@ export function ObligationCard({ obligation, index }: Props) {
           </div>
         </div>
 
-        {/* Health factor (only if borrowing) */}
-        {hf !== null && hasBorrow && (
+        {/* ── Correlated position: rate spread ── */}
+        {isCorrelated && (
+          <div
+            className="rounded-xl px-4 py-4 space-y-3"
+            style={{
+              background: 'rgba(99,102,241,0.05)',
+              border: '1px solid rgba(99,102,241,0.1)',
+            }}
+          >
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold text-indigo-400">Rate Spread</p>
+              {rateSpread !== null && (
+                <span
+                  className="text-sm font-black"
+                  style={{ color: rateSpread >= 0 ? '#34d399' : '#f87171' }}
+                >
+                  {rateSpread >= 0 ? '+' : ''}{pct(rateSpread)} net
+                </span>
+              )}
+            </div>
+            {stakingYield !== null && borrowRate !== null ? (
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <p className="text-slate-600 mb-0.5">Staking yield</p>
+                  <p className="text-slate-300 font-bold">{pct(stakingYield)}</p>
+                </div>
+                <div>
+                  <p className="text-slate-600 mb-0.5">Borrow rate</p>
+                  <p className="text-slate-300 font-bold">{pct(borrowRate)}</p>
+                </div>
+              </div>
+            ) : null}
+            <p className="text-xs text-slate-500 leading-relaxed">
+              <span className="text-indigo-400 font-semibold">Price-protected position. </span>
+              Both your collateral and debt are SOL-denominated — price moves in either direction
+              won't change your LTV or trigger liquidation.{' '}
+              {rateSpread !== null
+                ? rateSpread >= 0
+                  ? `You're earning ${pct(rateSpread)} net. The only risk is borrow rates rising above your yield.`
+                  : `Borrow rate currently exceeds yield by ${pct(Math.abs(rateSpread))} — this position is costing you money.`
+                : 'The only risk is borrow rates rising above your staking yield.'}
+            </p>
+          </div>
+        )}
+
+        {/* ── Standard position: health factor ── */}
+        {!isCorrelated && hf !== null && hasBorrow && (
           <div
             className="pt-5"
             style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}
@@ -126,8 +228,8 @@ export function ObligationCard({ obligation, index }: Props) {
           </div>
         )}
 
-        {/* LTV bar (only if borrowing and LTV data available) */}
-        {hasBorrow && ltv !== null && ltv > 0 && (
+        {/* ── Standard position: LTV bar ── */}
+        {!isCorrelated && hasBorrow && ltv !== null && ltv > 0 && (
           <div className="space-y-2.5">
             <div className="flex items-center justify-between">
               <div className="flex-1 min-w-0">
@@ -162,8 +264,8 @@ export function ObligationCard({ obligation, index }: Props) {
           </div>
         )}
 
-        {/* Lend-only callout */}
-        {!hasBorrow && (
+        {/* ── Lend-only callout ── */}
+        {!hasBorrow && !isCorrelated && (
           <div
             className="rounded-xl px-4 py-3.5"
             style={{

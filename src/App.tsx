@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { RiskLayer, RiskTier } from './types'
-import type { KaminoObligation, KaminoVaultPosition } from './api/kamino'
+import type { KaminoObligation, KaminoVaultPosition, ReserveInfo, ReserveRegistry } from './api/kamino'
 import { LandingHero } from './components/LandingHero'
 import { ObligationCard } from './components/ObligationCard'
 import { VaultCard } from './components/VaultCard'
@@ -10,6 +10,7 @@ import {
   fetchReserveMetrics,
   fetchUserObligations,
   fetchUserVaultPositions,
+  buildReserveRegistry,
   extractUtilization,
   getMarketKey,
 } from './api/kamino'
@@ -28,7 +29,10 @@ import {
 
 const REFRESH_MS = 60_000
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// Key reserves to monitor for pool liquidity display (Main Market)
+const KEY_RESERVES = ['USDC', 'SOL', 'USDT', 'jitoSOL', 'mSOL', 'bSOL']
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function fmt(n: number): string {
   if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`
@@ -97,6 +101,20 @@ function portfolioTotals(
   return { deposited, borrowed, net: deposited - borrowed, worstHF }
 }
 
+// Build a symbol-keyed map from the reserve registry for a given market
+function reservesBySymbolForMarket(
+  registry: ReserveRegistry,
+  marketKey: string
+): Record<string, ReserveInfo> {
+  const map: Record<string, ReserveInfo> = {}
+  for (const r of Object.values(registry)) {
+    if (r.marketKey === marketKey) {
+      map[r.symbol] = r
+    }
+  }
+  return map
+}
+
 const OVERALL_CONFIG: Record<
   RiskTier,
   { label: string; color: string; desc: string }
@@ -109,7 +127,88 @@ const OVERALL_CONFIG: Record<
   error:   { label: 'ERROR',       color: '#334155', desc: 'Could not load data. Check your connection.' },
 }
 
-// ─── App ─────────────────────────────────────────────────────────────────────
+// ─── Pool Liquidity Panel ─────────────────────────────────────────────────────
+
+function utilizationColor(u: number): string {
+  if (u >= 0.92) return '#ef4444'
+  if (u >= 0.82) return '#f97316'
+  if (u >= 0.72) return '#f59e0b'
+  return '#10b981'
+}
+
+function utilizationLabel(u: number, symbol: string): string {
+  const isStable = ['USDC', 'USDT'].includes(symbol)
+  const target = isStable ? 0.85 : 0.70
+  if (u >= 0.95) return 'Near cap — withdrawals severely constrained'
+  if (u >= target + 0.10) return 'Above target — borrow rates elevated, exiting may be slow'
+  if (u >= target) return 'At target — normal conditions'
+  return 'Below target — plenty of liquidity available'
+}
+
+interface PoolLiquidityPanelProps {
+  registry: ReserveRegistry
+  marketKey: string
+}
+
+function PoolLiquidityPanel({ registry, marketKey }: PoolLiquidityPanelProps) {
+  const reserves = Object.values(registry)
+    .filter(r => r.marketKey === marketKey && KEY_RESERVES.includes(r.symbol))
+    .sort((a, b) => b.totalSupplyUsd - a.totalSupplyUsd)
+
+  if (reserves.length === 0) return null
+
+  return (
+    <div
+      className="rounded-2xl overflow-hidden"
+      style={{
+        background: '#0d1117',
+        border: '1px solid rgba(255,255,255,0.06)',
+      }}
+    >
+      <div className="px-6 pt-5 pb-4" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+        <p className="text-[10px] font-bold tracking-[0.2em] text-slate-700 uppercase mb-1">
+          Pool Liquidity
+        </p>
+        <p className="text-xs text-slate-600">
+          How much of each reserve is borrowed — high utilization means you may not be able to withdraw immediately.
+        </p>
+      </div>
+      <div className="px-6 py-4 space-y-4">
+        {reserves.map(r => {
+          const u = r.utilization
+          const color = utilizationColor(u)
+          return (
+            <div key={r.reservePubkey} className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-300 font-semibold w-14">{r.symbol}</span>
+                  <span className="text-slate-700">{fmt(r.totalSupplyUsd)} supplied</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-slate-600">
+                    Earn {(r.supplyApy * 100).toFixed(2)}%
+                  </span>
+                  <span className="font-mono font-bold" style={{ color }}>
+                    {(u * 100).toFixed(1)}% used
+                  </span>
+                </div>
+              </div>
+              <div className="h-1.5 rounded-full overflow-hidden" style={{ background: '#1a1f2e' }}>
+                <div
+                  className="h-full rounded-full transition-all duration-700"
+                  style={{ width: `${Math.min(u * 100, 100)}%`, background: color }}
+                />
+              </div>
+              <p className="text-[10px] text-slate-700">{utilizationLabel(u, r.symbol)}</p>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [wallet, setWallet] = useState('')
@@ -122,6 +221,7 @@ export default function App() {
   const [countdown, setCountdown] = useState(REFRESH_MS / 1000)
   const [kaminoTVL, setKaminoTVL] = useState(0)
   const [protocolExpanded, setProtocolExpanded] = useState(false)
+  const [registry, setRegistry] = useState<ReserveRegistry>({})
 
   const fetchAll = useCallback(async () => {
     setLoading(true)
@@ -150,7 +250,18 @@ export default function App() {
       for (const f of pythPrices) priceMap[f.symbol.split('/')[0]] = f.price
       for (const p of jupPrices) if (p.price !== null) priceMap[p.symbol] = p.price
 
-      // ── Layer 1: Protocol Health
+      // ── Build reserve registry across all markets ──────────────────────────
+      // Do this in parallel with everything else; used for pool liquidity display
+      // and reserve-by-symbol lookups in ObligationCard
+      let newRegistry: ReserveRegistry = {}
+      try {
+        newRegistry = await buildReserveRegistry(markets)
+        setRegistry(newRegistry)
+      } catch (e) {
+        console.warn('[reserve registry]', e)
+      }
+
+      // ── Layer 1: Protocol Health ───────────────────────────────────────────
       try {
         let maxUtil = 0
         const primaryMarkets = markets.filter(m => m.isPrimary).slice(0, 5)
@@ -160,9 +271,6 @@ export default function App() {
         for (const result of reserveResults) {
           if (result.status !== 'fulfilled') continue
           for (const r of result.value) {
-            // Skip tiny reserves (< $1M supply) — they skew utilization to 100%
-            // due to rounding on low-liquidity assets and aren't relevant to
-            // protocol-wide withdrawal risk
             const supplyUsd = Number(r.totalSupplyUsd ?? 0)
             if (supplyUsd < 1_000_000) continue
             const u = extractUtilization(r)
@@ -181,7 +289,7 @@ export default function App() {
         newLayers.push(errorLayer('protocol', 'Protocol Health', 'TVL, reserve utilization, and liquidity depth', String(e)))
       }
 
-      // ── Layer 2: Oracle Risk
+      // ── Layer 2: Oracle Risk ───────────────────────────────────────────────
       try {
         const feeds = pythPrices.map(feed => ({
           symbol:       feed.symbol,
@@ -195,14 +303,14 @@ export default function App() {
         newLayers.push(errorLayer('oracle', 'Oracle Risk', 'Pyth feed staleness, confidence intervals, and cross-source deviation', String(e)))
       }
 
-      // ── Layer 3: Asset Risk
+      // ── Layer 3: Asset Risk ────────────────────────────────────────────────
       try {
         newLayers.push(scoreAssetRisk({ solPrice: priceMap['SOL'] ?? 0, prices: priceMap }))
       } catch (e) {
-        newLayers.push(errorLayer('asset', 'Asset Risk', 'Stablecoin peg deviation and LST depeg monitoring', String(e)))
+        newLayers.push(errorLayer('asset', 'Asset Risk', 'Stablecoin peg deviation and LST oracle method', String(e)))
       }
 
-      // ── Layer 4: Position Risk (wallet required)
+      // ── Layer 4: Position Risk (wallet required) ───────────────────────────
       if (wallet) {
         try {
           const [obligationResults, rawVaults] = await Promise.all([
@@ -215,7 +323,6 @@ export default function App() {
             r.status === 'fulfilled' ? r.value : []
           )
 
-          // Store raw data for portfolio view
           setObligations(allObligations)
           setVaultPositions(rawVaults)
 
@@ -225,7 +332,7 @@ export default function App() {
         }
       }
 
-      // ── Layer 5: Network Risk
+      // ── Layer 5: Network Risk ──────────────────────────────────────────────
       try {
         if (network) {
           newLayers.push(scoreNetworkRisk({ tps: network.tps, avgPriorityFee: network.avgPriorityFee }))
@@ -265,7 +372,7 @@ export default function App() {
     setWallet(w)
   }
 
-  // ── No wallet → Landing ────────────────────────────────────────────────────
+  // ── No wallet → Landing ───────────────────────────────────────────────────
   if (!wallet) {
     return (
       <LandingHero
@@ -276,14 +383,25 @@ export default function App() {
     )
   }
 
-  // ── With wallet → Portfolio view ───────────────────────────────────────────
+  // ── With wallet → Portfolio view ──────────────────────────────────────────
   const activeObligations = getActiveObligations(obligations)
   const activeVaults = vaultPositions.filter(v => Number(v.totalShares ?? 0) > 0)
   const hasPositions = activeObligations.length > 0 || activeVaults.length > 0
   const totals = portfolioTotals(activeObligations, activeVaults)
   const overall_cfg = OVERALL_CONFIG[overall]
 
-  // Protocol layers exclude the position layer (shown separately above)
+  // Determine which markets the user actually has positions in
+  const userMarketKeys = [...new Set(
+    activeObligations
+      .filter(o => o.marketKey)
+      .map(o => o.marketKey as string)
+  )]
+
+  // Primary market key for pool liquidity panel
+  const MAIN_MARKET = '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF'
+  const poolMarketKey = userMarketKeys.includes(MAIN_MARKET) ? MAIN_MARKET : userMarketKeys[0]
+
+  // Protocol layers (exclude position — shown in its own section)
   const protocolLayers = layers.filter(l => l.id !== 'position')
 
   return (
@@ -355,7 +473,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-4 sm:px-6 py-8 space-y-8">
+      <main className="max-w-4xl mx-auto px-4 sm:px-6 py-8 space-y-6">
 
         {/* ── Portfolio Summary ── */}
         <div
@@ -398,13 +516,15 @@ export default function App() {
           </div>
 
           {/* Totals grid */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 divide-x divide-y sm:divide-y-0"
-            style={{ '--tw-divide-opacity': 0.04 } as React.CSSProperties}>
+          <div
+            className="grid grid-cols-2 sm:grid-cols-4 divide-x divide-y sm:divide-y-0"
+            style={{ '--tw-divide-opacity': 0.04 } as React.CSSProperties}
+          >
             {[
               { label: 'Total Deposited', value: totals.deposited > 0 ? fmt(totals.deposited) : '—', sub: 'collateral + vaults' },
-              { label: 'Total Borrowed', value: totals.borrowed > 0 ? fmt(totals.borrowed) : '—', sub: 'outstanding debt' },
-              { label: 'Net Worth', value: totals.deposited > 0 ? fmt(totals.net) : '—', sub: 'deposited minus debt', highlight: totals.net },
-              { label: 'Active Positions', value: loading ? '…' : String(activeObligations.length + activeVaults.length), sub: 'across all markets' },
+              { label: 'Total Borrowed',  value: totals.borrowed  > 0 ? fmt(totals.borrowed)  : '—', sub: 'outstanding debt' },
+              { label: 'Net Worth',       value: totals.deposited > 0 ? fmt(totals.net) : '—',         sub: 'deposited minus debt', highlight: totals.net },
+              { label: 'Active Positions',value: loading ? '…' : String(activeObligations.length + activeVaults.length), sub: 'across all markets' },
             ].map(({ label, value, sub, highlight }) => (
               <div key={label} className="px-5 py-4" style={{ borderColor: 'rgba(255,255,255,0.04)' }}>
                 <p className="text-[11px] text-slate-600 font-medium mb-1.5">{label}</p>
@@ -427,7 +547,6 @@ export default function App() {
 
         {/* ── Positions ── */}
         {loading && !hasPositions ? (
-          // Skeleton
           <div className="space-y-4">
             {[0, 1].map(i => (
               <div
@@ -438,7 +557,6 @@ export default function App() {
             ))}
           </div>
         ) : !hasPositions ? (
-          // No positions found
           <div
             className="rounded-2xl px-6 py-10 text-center"
             style={{ background: '#0d1117', border: '1px solid rgba(255,255,255,0.06)' }}
@@ -454,13 +572,30 @@ export default function App() {
             <h2 className="text-[10px] font-bold tracking-[0.2em] text-slate-700 uppercase px-1">
               Your Positions ({activeObligations.length + activeVaults.length})
             </h2>
-            {activeObligations.map((obl, i) => (
-              <ObligationCard key={obl.obligationAddress || i} obligation={obl} index={i} />
-            ))}
+
+            {activeObligations.map((obl, i) => {
+              const symMap = obl.marketKey
+                ? reservesBySymbolForMarket(registry, obl.marketKey)
+                : {}
+              return (
+                <ObligationCard
+                  key={obl.obligationAddress || i}
+                  obligation={obl}
+                  index={i}
+                  reservesBySymbol={symMap}
+                />
+              )
+            })}
+
             {activeVaults.map((vault, i) => (
               <VaultCard key={vault.vaultAddress || i} position={vault} index={i} />
             ))}
           </div>
+        )}
+
+        {/* ── Pool Liquidity (shown when user has positions) ── */}
+        {hasPositions && poolMarketKey && Object.keys(registry).length > 0 && (
+          <PoolLiquidityPanel registry={registry} marketKey={poolMarketKey} />
         )}
 
         {/* ── Protocol Health (collapsible) ── */}
@@ -481,8 +616,10 @@ export default function App() {
                 — Kamino-wide risk signals
               </span>
             </div>
-            <span className="text-slate-700 text-sm transition-transform duration-200"
-              style={{ display: 'inline-block', transform: protocolExpanded ? 'rotate(180deg)' : 'none' }}>
+            <span
+              className="text-slate-700 text-sm transition-transform duration-200"
+              style={{ display: 'inline-block', transform: protocolExpanded ? 'rotate(180deg)' : 'none' }}
+            >
               ▾
             </span>
           </button>
@@ -494,6 +631,23 @@ export default function App() {
               ))}
             </div>
           )}
+        </div>
+
+        {/* ── Trust signal ── */}
+        <div
+          className="rounded-xl px-5 py-4 flex items-start gap-3"
+          style={{
+            background: 'rgba(16,185,129,0.04)',
+            border: '1px solid rgba(16,185,129,0.08)',
+          }}
+        >
+          <span className="text-emerald-500 text-base mt-0.5 flex-shrink-0">✓</span>
+          <p className="text-[11px] text-slate-600 leading-relaxed">
+            <span className="text-emerald-500 font-semibold">Zero bad debt on record.</span>{' '}
+            Kamino processed 55,649 liquidations during the February 2026 SOL crash without
+            a single bad debt event. Protocol parameters and dynamic liquidation bonuses are
+            designed to keep collateral liquidated before positions go underwater.
+          </p>
         </div>
 
         {/* Footer */}

@@ -1,5 +1,7 @@
 const BASE = 'https://api.kamino.finance'
 
+// ─── Market definitions ───────────────────────────────────────────────────────
+
 export interface KaminoMarket {
   lendingMarket?: string
   pubkey?: string
@@ -7,6 +9,32 @@ export interface KaminoMarket {
   name?: string
   isPrimary?: boolean
 }
+
+// Well-known markets and their position type classification
+// Used to infer risk profile without per-token breakdown
+export const MARKET_NAMES: Record<string, string> = {
+  '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF': 'Main Market',
+  'DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek': 'JLP Market',
+  'ByYiZxp8QrdN9qbdtaAiePN8AAr3qvTPppNJDpf5DVJ5': 'Altcoins Market',
+  'H6rHXmXoCQvq8Ue81MqNh7ow5ysPa1dSozwW3PU1dDH6': 'Jito Market',
+  'GVDUXFwS8uvBG35RjZv6Y8S1AkV5uASiMJ9qTUKqb5PL': 'Marinade Market',
+  'BJnbcRHqvppTyGesLzWASGKnmnF1wq9jZu6ExrjT7wvF': 'Ethena Market',
+  'GMqmFygF5iSm5nkckYU6tieggFcR42SyjkkhK5rswFRs': 'Bitcoin Market',
+  '3EZEy7vBTJ8Q9PWxKwdLVULRdsvVLT51rpBG3gH1TSJ5': 'Jupiter Market',
+  'eNLm5e5KVDX2vEcCkt75PpZ2GMfXcZES3QrFshgpVzp':  'INF/SOL Market',
+  'C7h9YnjPrDvNhe2cWWDhCu4CZEB1XTTH4RzjmsHuengV': 'bSOL/SOL Market',
+}
+
+// Markets where collateral and debt are both SOL-denominated (correlated)
+// → price moves don't affect LTV; only risk is borrow rate > staking yield
+export const CORRELATED_MARKETS = new Set([
+  'H6rHXmXoCQvq8Ue81MqNh7ow5ysPa1dSozwW3PU1dDH6', // Jito
+  'GVDUXFwS8uvBG35RjZv6Y8S1AkV5uASiMJ9qTUKqb5PL', // Marinade
+  'eNLm5e5KVDX2vEcCkt75PpZ2GMfXcZES3QrFshgpVzp',  // INF/SOL
+  'C7h9YnjPrDvNhe2cWWDhCu4CZEB1XTTH4RzjmsHuengV', // bSOL/SOL
+])
+
+// ─── Reserve types ────────────────────────────────────────────────────────────
 
 export interface KaminoReserve {
   reserve?: string
@@ -24,7 +52,30 @@ export interface KaminoReserve {
   totalSupplyUsd?: number | string
   totalBorrowUsd?: number | string
   liquidityAvailableAmount?: number
+  borrowApy?: number | string
+  supplyApy?: number | string
+  maxLtv?: number | string
 }
+
+// Enriched reserve entry in the registry — keyed by reserve pubkey
+export interface ReserveInfo {
+  reservePubkey: string
+  symbol: string
+  mint: string
+  utilization: number        // 0–1
+  supplyApy: number          // 0–1 (e.g. 0.045 = 4.5%)
+  borrowApy: number          // 0–1
+  totalSupplyUsd: number
+  totalBorrowUsd: number
+  maxLtv: number             // 0–1
+  marketKey: string
+  marketName: string
+}
+
+// Registry: reserve pubkey → ReserveInfo
+export type ReserveRegistry = Record<string, ReserveInfo>
+
+// ─── Obligation types ─────────────────────────────────────────────────────────
 
 export interface KaminoObligationStats {
   borrowLimit?: string | number
@@ -39,17 +90,46 @@ export interface KaminoObligationStats {
   borrowUtilization?: string | number
 }
 
+// Per-token deposit/borrow entries — may or may not be returned by the API
+export interface ObligationDeposit {
+  reserveAddress?: string
+  mintAddress?: string
+  symbol?: string
+  amount?: string | number
+  amountUsd?: string | number
+  marketValueUsd?: string | number
+}
+
+export interface ObligationBorrow {
+  reserveAddress?: string
+  mintAddress?: string
+  symbol?: string
+  amount?: string | number
+  amountUsd?: string | number
+  marketValueUsd?: string | number
+  borrowedAmountUsd?: string | number
+}
+
 export interface KaminoObligation {
   obligationAddress?: string
   humanTag?: string
   refreshedStats?: KaminoObligationStats
-  // Legacy flat fields (some API responses may still include these)
+  // Per-token breakdown (populated if returned by API)
+  deposits?: ObligationDeposit[]
+  borrows?: ObligationBorrow[]
+  // Market context — injected by our fetch function
+  marketKey?: string
+  marketName?: string
+  isCorrelated?: boolean   // true = LST/SOL eMode-style, price moves don't affect LTV
+  // Legacy flat fields
   healthFactor?: number
   loanToValue?: number
   depositedValue?: number
   borrowedValue?: number
   netAccountValue?: number
 }
+
+// ─── Vault types ──────────────────────────────────────────────────────────────
 
 export interface KaminoVaultPosition {
   vaultAddress?: string
@@ -61,6 +141,8 @@ export interface KaminoVaultPosition {
   sharePrice?: number
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 function getMarketKey(market: KaminoMarket): string {
   return (market.lendingMarket || market.pubkey || market.address || '') as string
 }
@@ -69,8 +151,8 @@ export function extractUtilization(r: KaminoReserve): number {
   // Try explicit ratio fields first
   const raw = r.utilizationRatio ?? r.borrowUtilizationRatio ?? r.borrowUtilization ?? r.utilizationPct
   if (raw !== undefined && raw !== null) {
-    const v = raw > 1 ? raw / 100 : raw
-    return Math.min(v, 1) // cap at 100% — tiny reserves can report >100% due to rounding
+    const v = Number(raw) > 1 ? Number(raw) / 100 : Number(raw)
+    return Math.min(v, 1)
   }
   // Calculate from totalBorrow / totalSupply
   const supply = Number(r.totalSupply ?? r.totalSupplyUsd ?? 0)
@@ -78,6 +160,8 @@ export function extractUtilization(r: KaminoReserve): number {
   if (supply > 0) return Math.min(borrow / supply, 1)
   return 0
 }
+
+// ─── API calls ────────────────────────────────────────────────────────────────
 
 export async function fetchMarkets(): Promise<KaminoMarket[]> {
   const res = await fetch(`${BASE}/v2/kamino-market`)
@@ -93,6 +177,60 @@ export async function fetchReserveMetrics(marketPubkey: string): Promise<KaminoR
   return Array.isArray(raw) ? raw : (raw.reserves || raw.data || [])
 }
 
+/**
+ * Builds a registry of reserve pubkey → enriched reserve info across all provided markets.
+ * Used to map obligation deposit/borrow reserve pubkeys to human-readable token info.
+ */
+export async function buildReserveRegistry(
+  markets: KaminoMarket[]
+): Promise<ReserveRegistry> {
+  const registry: ReserveRegistry = {}
+
+  const results = await Promise.allSettled(
+    markets.map(async (market) => {
+      const marketKey = getMarketKey(market)
+      if (!marketKey) return
+      const marketName = market.name ?? MARKET_NAMES[marketKey] ?? marketKey.slice(0, 8)
+      const reserves = await fetchReserveMetrics(marketKey)
+
+      for (const r of reserves) {
+        const pubkey = r.reserve
+        if (!pubkey) continue
+        const symbol = r.liquidityToken ?? r.symbol ?? 'Unknown'
+        const mint   = r.liquidityTokenMint ?? r.mint ?? ''
+        const supplyUsd = Number(r.totalSupplyUsd ?? 0)
+        if (supplyUsd < 1_000) continue // skip dust reserves
+
+        const utilization = extractUtilization(r)
+        const supplyApy   = Number(r.supplyApy ?? 0)
+        const borrowApy   = Number(r.borrowApy ?? 0)
+        const maxLtv      = Number(r.maxLtv ?? 0)
+
+        registry[pubkey] = {
+          reservePubkey: pubkey,
+          symbol,
+          mint,
+          utilization,
+          supplyApy,
+          borrowApy,
+          totalSupplyUsd: supplyUsd,
+          totalBorrowUsd: Number(r.totalBorrowUsd ?? 0),
+          maxLtv,
+          marketKey,
+          marketName,
+        }
+      }
+    })
+  )
+
+  // Surface any unexpected errors in dev
+  for (const r of results) {
+    if (r.status === 'rejected') console.warn('[reserve registry]', r.reason)
+  }
+
+  return registry
+}
+
 export async function fetchUserObligations(
   marketPubkey: string,
   wallet: string
@@ -101,7 +239,19 @@ export async function fetchUserObligations(
   if (res.status === 404) return []
   if (!res.ok) throw new Error(`Kamino obligations ${res.status}`)
   const raw = await res.json()
-  return Array.isArray(raw) ? raw : (raw.obligations || raw.data || [])
+  const obligations: KaminoObligation[] = Array.isArray(raw)
+    ? raw
+    : (raw.obligations || raw.data || [])
+
+  // Inject market context into each obligation
+  const marketName   = MARKET_NAMES[marketPubkey] ?? 'Unknown Market'
+  const isCorrelated = CORRELATED_MARKETS.has(marketPubkey)
+  return obligations.map(obl => ({
+    ...obl,
+    marketKey:    marketPubkey,
+    marketName,
+    isCorrelated,
+  }))
 }
 
 async function fetchVaultSharePrice(vaultAddress: string): Promise<number> {
@@ -122,7 +272,6 @@ export async function fetchUserVaultPositions(wallet: string): Promise<KaminoVau
   const raw = await res.json()
   const positions: KaminoVaultPosition[] = Array.isArray(raw) ? raw : (raw.positions || raw.data || [])
 
-  // Enrich each position with USD value from vault metrics
   const enriched = await Promise.allSettled(
     positions.map(async (pos) => {
       if (!pos.vaultAddress) return pos
