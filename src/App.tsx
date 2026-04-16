@@ -320,7 +320,7 @@ export default function App() {
             Promise.allSettled(
               markets.map(m => fetchUserObligations(getMarketKey(m), wallet))
             ),
-            fetchUserVaultPositions(wallet).catch(() => [] as KaminoVaultPosition[]),
+            fetchUserVaultPositions(wallet, newRegistry).catch(() => [] as KaminoVaultPosition[]),
           ])
           const allObligations = obligationResults.flatMap(r =>
             r.status === 'fulfilled' ? r.value : []

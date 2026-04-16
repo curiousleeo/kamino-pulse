@@ -1,3 +1,5 @@
+import { fetchVaultTokenInfo } from './helius'
+
 const BASE = 'https://api.kamino.finance'
 
 // ─── Market definitions ───────────────────────────────────────────────────────
@@ -141,6 +143,9 @@ export interface KaminoVaultPosition {
   sharePrice?: number
   tokenPrice?: number          // underlying token USD price — ≈1.00 = stablecoin
   tokenType?: 'stablecoin' | 'volatile' | 'unknown'
+  tokenMint?: string           // underlying token mint pubkey (from on-chain)
+  tokenSymbol?: string         // resolved symbol from reserve registry
+  reservePubkey?: string       // associated Kamino lending reserve (from on-chain)
   tokensAvailable?: number     // tokens in vault buffer available to withdraw NOW
   tokensAvailableUsd?: number
   tokensInvested?: number      // tokens deployed into lending market
@@ -314,7 +319,11 @@ async function fetchVaultMetrics(vaultAddress: string): Promise<VaultMetrics> {
   }
 }
 
-export async function fetchUserVaultPositions(wallet: string): Promise<KaminoVaultPosition[]> {
+export async function fetchUserVaultPositions(
+  wallet: string,
+  // Optional registry to resolve token symbols from on-chain mint pubkeys
+  registry?: ReserveRegistry
+): Promise<KaminoVaultPosition[]> {
   const res = await fetch(`${BASE}/kvaults/users/${wallet}/positions`)
   if (res.status === 404) return []
   if (!res.ok) throw new Error(`Kamino vault positions ${res.status}`)
@@ -324,22 +333,44 @@ export async function fetchUserVaultPositions(wallet: string): Promise<KaminoVau
   const enriched = await Promise.allSettled(
     positions.map(async (pos) => {
       if (!pos.vaultAddress) return pos
-      const metrics = await fetchVaultMetrics(pos.vaultAddress)
+
+      const [metrics, tokenInfo] = await Promise.all([
+        fetchVaultMetrics(pos.vaultAddress),
+        fetchVaultTokenInfo(pos.vaultAddress),
+      ])
+
       const totalShares = Number(pos.totalShares ?? 0)
+
+      // Resolve token symbol from registry using reserve pubkey (most reliable)
+      // Fall back to mint lookup if reserve not in registry
+      let tokenSymbol: string | undefined
+      if (tokenInfo && registry) {
+        const byReserve = registry[tokenInfo.reservePubkey]
+        if (byReserve) {
+          tokenSymbol = byReserve.symbol
+        } else {
+          const byMint = Object.values(registry).find(r => r.mint === tokenInfo.tokenMint)
+          tokenSymbol = byMint?.symbol
+        }
+      }
+
       return {
         ...pos,
-        sharePrice:       metrics.sharePrice,
-        totalValueUsd:    totalShares * metrics.sharePrice,
-        tokenPrice:       metrics.tokenPrice,
-        tokenType:        metrics.tokenType,
+        sharePrice:        metrics.sharePrice,
+        totalValueUsd:     totalShares * metrics.sharePrice,
+        tokenPrice:        metrics.tokenPrice,
+        tokenType:         metrics.tokenType,
+        tokenMint:         tokenInfo?.tokenMint,
+        tokenSymbol,
+        reservePubkey:     tokenInfo?.reservePubkey,
         tokensAvailable:    metrics.tokensAvailable,
         tokensAvailableUsd: metrics.tokensAvailableUsd,
         tokensInvested:     metrics.tokensInvested,
-        apy:            metrics.apy,
-        apy7d:          metrics.apy7d,
-        apy30d:         metrics.apy30d,
-        apyFarmRewards: metrics.apyFarmRewards,
-        numberOfHolders: metrics.numberOfHolders,
+        apy:               metrics.apy,
+        apy7d:             metrics.apy7d,
+        apy30d:            metrics.apy30d,
+        apyFarmRewards:    metrics.apyFarmRewards,
+        numberOfHolders:   metrics.numberOfHolders,
       }
     })
   )

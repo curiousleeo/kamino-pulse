@@ -20,18 +20,19 @@ export function VaultCard({ position, index }: Props) {
   const addr = position.vaultAddress || ''
   const shortAddr = addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : `Vault ${index + 1}`
 
-  const totalShares   = Number(position.totalShares ?? 0)
-  const value         = position.totalValueUsd ?? 0
-  const sharePrice    = position.sharePrice ?? null
-  const tokenPrice    = position.tokenPrice ?? null
-  const tokenType     = position.tokenType ?? 'unknown'
-  const tokensAvail   = position.tokensAvailableUsd ?? 0
+  const totalShares    = Number(position.totalShares ?? 0)
+  const value          = position.totalValueUsd ?? 0
+  const sharePrice     = position.sharePrice ?? null
+  const tokenPrice     = position.tokenPrice ?? null
+  const tokenType      = position.tokenType ?? 'unknown'
+  const tokenSymbol    = position.tokenSymbol ?? null
+  const tokensAvail    = position.tokensAvailableUsd ?? 0
   const tokensInvested = position.tokensInvested ?? 0
-  const apy7d         = position.apy7d ?? 0
-  const apy30d        = position.apy30d ?? 0
-  const apyBase       = position.apy ?? 0
-  const apyFarm       = position.apyFarmRewards ?? 0
-  const holders       = position.numberOfHolders ?? 0
+  const apy7d          = position.apy7d ?? 0
+  const apy30d         = position.apy30d ?? 0
+  const apyBase        = position.apy ?? 0
+  const apyFarm        = position.apyFarmRewards ?? 0
+  const holders        = position.numberOfHolders ?? 0
 
   // Withdrawal liquidity — tokensAvailableUsd vs total vault size
   // This is the vault's idle buffer, not the full lending pool availability
@@ -78,14 +79,22 @@ export function VaultCard({ position, index }: Props) {
               >
                 K-VAULT
               </span>
-              {tokenType === 'stablecoin' && (
+              {tokenSymbol && (
                 <span
                   className="text-[9px] font-bold tracking-[0.15em] px-2 py-0.5 rounded-md"
                   style={{
-                    color: '#34d399',
-                    background: 'rgba(52,211,153,0.08)',
-                    border: '1px solid rgba(52,211,153,0.12)',
+                    color: tokenType === 'stablecoin' ? '#34d399' : '#f59e0b',
+                    background: tokenType === 'stablecoin' ? 'rgba(52,211,153,0.08)' : 'rgba(245,158,11,0.08)',
+                    border: tokenType === 'stablecoin' ? '1px solid rgba(52,211,153,0.12)' : '1px solid rgba(245,158,11,0.12)',
                   }}
+                >
+                  {tokenSymbol}
+                </span>
+              )}
+              {!tokenSymbol && tokenType === 'stablecoin' && (
+                <span
+                  className="text-[9px] font-bold tracking-[0.15em] px-2 py-0.5 rounded-md"
+                  style={{ color: '#34d399', background: 'rgba(52,211,153,0.08)', border: '1px solid rgba(52,211,153,0.12)' }}
                 >
                   STABLECOIN
                 </span>
