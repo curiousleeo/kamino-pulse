@@ -1,8 +1,9 @@
-import type { KaminoVaultPosition } from '../api/kamino'
+import type { KaminoVaultPosition, ReserveRegistry } from '../api/kamino'
 
 interface Props {
   position: KaminoVaultPosition
   index: number
+  registry?: ReserveRegistry
 }
 
 function fmtUsd(n: number): string {
@@ -16,7 +17,7 @@ function fmtApy(n: number): string {
   return `${(n * 100).toFixed(2)}%`
 }
 
-export function VaultCard({ position, index }: Props) {
+export function VaultCard({ position, index, registry }: Props) {
   const addr = position.vaultAddress || ''
   const shortAddr = addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : `Vault ${index + 1}`
 
@@ -34,15 +35,22 @@ export function VaultCard({ position, index }: Props) {
   const apyFarm        = position.apyFarmRewards ?? 0
   const holders        = position.numberOfHolders ?? 0
 
-  // Withdrawal liquidity — tokensAvailableUsd vs total vault size
-  // This is the vault's idle buffer, not the full lending pool availability
+  // Vault idle buffer — almost always near-zero because vaults deploy capital to the reserve
   const totalVaultUsd = tokensInvested * (tokenPrice || 1) + tokensAvail
   const bufferPct = totalVaultUsd > 0 ? tokensAvail / totalVaultUsd : 0
 
-  // Determine withdrawal signal — low buffer doesn't mean fully locked
-  // (lending market may still have liquidity), but it's worth showing
-  const withdrawalStatus: 'tight' | 'ok' =
-    tokensAvail < 1000 ? 'tight' : 'ok'
+  // Real withdrawal capacity = available liquidity in the UNDERLYING RESERVE
+  // Look up the reserve this vault deploys to via reservePubkey (decoded on-chain)
+  const reserveInfo = registry && position.reservePubkey ? registry[position.reservePubkey] : undefined
+  const reserveUtil = reserveInfo?.utilization ?? null
+
+  // Withdrawal status based on reserve utilization, not vault buffer
+  // 92%+ = severely constrained, 82%+ = elevated, else = available
+  const withdrawalStatus: 'constrained' | 'elevated' | 'ok' | 'unknown' =
+    reserveUtil === null ? 'unknown'
+    : reserveUtil >= 0.92 ? 'constrained'
+    : reserveUtil >= 0.82 ? 'elevated'
+    : 'ok'
 
   // Stablecoin peg check from vault metrics
   const pegDeviation = tokenType === 'stablecoin' && tokenPrice
@@ -180,58 +188,90 @@ export function VaultCard({ position, index }: Props) {
           </div>
         )}
 
-        {/* Withdrawal liquidity */}
+        {/* Withdrawal liquidity — based on reserve utilization, not vault idle buffer */}
         <div
           className="rounded-xl px-4 py-3.5 space-y-2"
           style={
-            withdrawalStatus === 'tight'
-              ? { background: 'rgba(245,158,11,0.05)', border: '1px solid rgba(245,158,11,0.15)' }
+            withdrawalStatus === 'constrained'
+              ? { background: 'rgba(239,68,68,0.05)', border: '1px solid rgba(239,68,68,0.15)' }
+              : withdrawalStatus === 'elevated'
+              ? { background: 'rgba(245,158,11,0.05)', border: '1px solid rgba(245,158,11,0.12)' }
+              : withdrawalStatus === 'unknown'
+              ? { background: 'rgba(100,116,139,0.04)', border: '1px solid rgba(100,116,139,0.1)' }
               : { background: 'rgba(16,185,129,0.04)', border: '1px solid rgba(16,185,129,0.08)' }
           }
         >
           <div className="flex items-center justify-between">
             <p
               className="text-xs font-semibold"
-              style={{ color: withdrawalStatus === 'tight' ? '#f59e0b' : '#10b981' }}
+              style={{
+                color: withdrawalStatus === 'constrained' ? '#ef4444'
+                  : withdrawalStatus === 'elevated' ? '#f59e0b'
+                  : withdrawalStatus === 'unknown' ? '#64748b'
+                  : '#10b981'
+              }}
             >
               Withdrawal Liquidity
             </p>
             <span
               className="text-[10px] font-bold"
-              style={{ color: withdrawalStatus === 'tight' ? '#f59e0b' : '#34d399' }}
+              style={{
+                color: withdrawalStatus === 'constrained' ? '#ef4444'
+                  : withdrawalStatus === 'elevated' ? '#f59e0b'
+                  : withdrawalStatus === 'unknown' ? '#64748b'
+                  : '#34d399'
+              }}
             >
-              {withdrawalStatus === 'tight' ? 'CONSTRAINED' : 'AVAILABLE'}
+              {withdrawalStatus === 'constrained' ? 'CONSTRAINED'
+                : withdrawalStatus === 'elevated' ? 'ELEVATED'
+                : withdrawalStatus === 'unknown' ? 'CHECK BELOW'
+                : 'AVAILABLE'}
             </span>
           </div>
 
-          {/* Buffer bar */}
-          {bufferPct > 0 && (
+          {/* Reserve utilization bar — the real withdrawal signal */}
+          {reserveUtil !== null && (
             <div className="space-y-1">
               <div className="h-1 rounded-full overflow-hidden" style={{ background: '#1a1f2e' }}>
                 <div
                   className="h-full rounded-full"
                   style={{
-                    width: `${Math.min(bufferPct * 100, 100)}%`,
-                    background: withdrawalStatus === 'tight' ? '#f59e0b' : '#10b981',
+                    width: `${Math.min(reserveUtil * 100, 100)}%`,
+                    background: withdrawalStatus === 'constrained' ? '#ef4444'
+                      : withdrawalStatus === 'elevated' ? '#f59e0b'
+                      : '#10b981',
                   }}
                 />
               </div>
-              <p className="text-[10px] text-slate-700">
-                {fmtUsd(tokensAvail)} idle in vault buffer
-                {totalVaultUsd > 0 && ` (${(bufferPct * 100).toFixed(2)}% of vault)`}
+              <p className="text-[10px] text-slate-500">
+                Reserve utilization: <span className="font-mono font-semibold">{(reserveUtil * 100).toFixed(1)}%</span>
+                {reserveInfo && (
+                  <> · {fmtUsd(reserveInfo.totalSupplyUsd * (1 - reserveUtil))} available to withdraw</>
+                )}
               </p>
             </div>
           )}
 
-          <p className="text-xs text-slate-500 leading-relaxed">
-            {withdrawalStatus === 'tight'
-              ? 'The vault\'s immediate buffer is nearly empty. Your withdrawal may take time as the vault pulls funds from the underlying lending pool. Check pool utilization below to gauge how long this might take.'
-              : 'Vault has idle buffer available. Withdrawals should process quickly.'}
+          {/* Vault buffer — secondary info, always near-zero by design */}
+          {bufferPct > 0 && (
+            <p className="text-[10px] text-slate-700">
+              {fmtUsd(tokensAvail)} in vault idle buffer (instant)
+            </p>
+          )}
+
+          <p className="text-xs leading-relaxed" style={{ color: '#64748b' }}>
+            {withdrawalStatus === 'constrained'
+              ? `${(reserveUtil! * 100).toFixed(1)}% of the reserve is borrowed — liquidity is tight. Withdrawals may be delayed while the protocol waits for borrowers to repay.`
+              : withdrawalStatus === 'elevated'
+              ? `${(reserveUtil! * 100).toFixed(1)}% utilization — above optimal. Enough liquidity to exit, but larger withdrawals may take a few cycles.`
+              : withdrawalStatus === 'unknown'
+              ? 'Reserve data not loaded yet. See the Pool Liquidity panel below for this vault\'s underlying reserve.'
+              : `${(reserveUtil! * 100).toFixed(1)}% utilization — plenty of reserve liquidity. Your position is easy to exit.`}
           </p>
 
-          <p className="text-xs text-slate-700">
+          <p className="text-[11px] text-slate-700">
             <span className="text-slate-500">No liquidation risk</span>
-            {' '}— earn-only position. Your principal is safe; the only risk is temporary illiquidity.
+            {' '}— earn-only. The only risk is temporary illiquidity if utilization spikes above ~95%.
           </p>
         </div>
 
