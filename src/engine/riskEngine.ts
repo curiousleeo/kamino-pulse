@@ -146,10 +146,10 @@ export function scoreAssetRisk(p: {
   const signals: RiskSignal[] = []
   const { prices } = p
 
-  // Stablecoin peg deviation — USDC and USDT use traditional reserve-backed pegs
-  // Price band rejects any oracle price outside ±1% automatically, but we surface
-  // smaller deviations so users can react before the circuit breaker fires
-  for (const sym of ['USDC', 'USDT']) {
+  // Stablecoin peg deviation — check every stablecoin we have a price for.
+  // Kamino uses price bands (±1% for pegged assets) as a circuit breaker.
+  // We surface smaller deviations so users can react before the band fires.
+  for (const sym of ['USDC', 'USDT', 'PYUSD', 'USDS']) {
     const price = prices[sym]
     if (price === null || price === undefined) {
       signals.push({ label: `${sym} Peg`, value: 'N/A', status: 'yellow', detail: 'Price unavailable' })

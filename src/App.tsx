@@ -29,8 +29,10 @@ import {
 
 const REFRESH_MS = 60_000
 
-// Key reserves to monitor for pool liquidity display (Main Market)
-const KEY_RESERVES = ['USDC', 'SOL', 'USDT', 'jitoSOL', 'mSOL', 'bSOL']
+// Minimum supply USD to show in pool liquidity panel
+const MIN_POOL_SUPPLY_USD = 5_000_000  // $5M — filters out dust/micro reserves
+// Max number of reserves to display in the liquidity panel
+const MAX_POOL_ROWS = 12
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -152,8 +154,9 @@ interface PoolLiquidityPanelProps {
 
 function PoolLiquidityPanel({ registry, marketKey }: PoolLiquidityPanelProps) {
   const reserves = Object.values(registry)
-    .filter(r => r.marketKey === marketKey && KEY_RESERVES.includes(r.symbol))
+    .filter(r => r.marketKey === marketKey && r.totalSupplyUsd >= MIN_POOL_SUPPLY_USD)
     .sort((a, b) => b.totalSupplyUsd - a.totalSupplyUsd)
+    .slice(0, MAX_POOL_ROWS)
 
   if (reserves.length === 0) return null
 
