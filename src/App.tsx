@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { RiskLayer, RiskTier } from './types'
 import type { KaminoObligation, KaminoVaultPosition, ReserveInfo, ReserveRegistry } from './api/kamino'
 import { LandingHero } from './components/LandingHero'
@@ -223,7 +223,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [countdown, setCountdown] = useState(REFRESH_MS / 1000)
   const [kaminoTVL, setKaminoTVL] = useState(0)
-  const prevTVLRef = useRef(0)
+
   const [protocolExpanded, setProtocolExpanded] = useState(false)
   const [registry, setRegistry] = useState<ReserveRegistry>({})
 
@@ -266,10 +266,11 @@ export default function App() {
         const tvlFromRegistry = computeTVLFromRegistry(newRegistry)
         if (tvlFromRegistry > 0) setKaminoTVL(tvlFromRegistry)
 
-        // Peak utilization: scan registry (already built) + any missing primary markets
+        // Peak utilization across significant reserves ($1M+ supply only)
+        // Micro reserves often hit 100% from rounding — ignore them for protocol signal
         let maxUtil = 0
         for (const r of Object.values(newRegistry)) {
-          if (r.utilization > maxUtil) maxUtil = r.utilization
+          if (r.totalSupplyUsd >= 1_000_000 && r.utilization > maxUtil) maxUtil = r.utilization
         }
         // If registry was empty, fall back to fetching primary markets directly
         if (Object.keys(newRegistry).length === 0) {

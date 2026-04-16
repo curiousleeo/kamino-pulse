@@ -292,43 +292,99 @@ interface VaultMetrics {
   reserveUtilization: number  // 0–1
 }
 
-/**
- * Try multiple Kamino endpoints to get reserve-level stats for a vault.
- * The /metrics endpoint doesn't include supply/borrow/utilization — try the
- * base vault endpoint and v2 variants which may have more data.
- */
-async function fetchVaultReserveStats(vaultAddress: string): Promise<{
+interface VaultReserveStats {
   totalSupplyUsd: number
   totalBorrowUsd: number
   reserveUtilization: number
-}> {
-  const empty = { totalSupplyUsd: 0, totalBorrowUsd: 0, reserveUtilization: 0 }
-  const endpoints = [
-    `${BASE}/kvaults/${vaultAddress}`,
-    `${BASE}/v2/kvaults/${vaultAddress}`,
-  ]
-  for (const url of endpoints) {
-    try {
-      const res = await fetch(url)
-      if (!res.ok) continue
+  // Bonus structural fields that may be returned by vault API
+  resolvedReservePubkey?: string
+  resolvedMarketPubkey?: string
+  resolvedTokenMint?: string
+  resolvedTokenSymbol?: string
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractReserveStatsFromObj(d: Record<string, any>): Partial<VaultReserveStats> {
+  const supply = Number(
+    d.totalSupplyUsd ?? d.totalDeposited ?? d.totalSupplied ??
+    d.tvl ?? d.totalLiquidity ?? d.totalValueLocked ?? 0
+  )
+  const borrow = Number(
+    d.totalBorrowUsd ?? d.totalBorrowed ?? d.totalBorrows ?? d.totalDebt ?? 0
+  )
+  let util = Number(
+    d.utilizationRatio ?? d.utilizationRate ?? d.utilization ??
+    d.reserveUtilization ?? d.borrowUtilization ?? d.utilizationPct ?? 0
+  )
+  if (util === 0 && supply > 0 && borrow > 0) util = Math.min(borrow / supply, 1)
+  if (util > 1) util = util / 100
+  return {
+    totalSupplyUsd: supply,
+    totalBorrowUsd: borrow,
+    reserveUtilization: util,
+    resolvedReservePubkey: d.reservePubkey ?? d.reserve ?? d.reserveAddress,
+    resolvedMarketPubkey:  d.marketPubkey  ?? d.lendingMarket ?? d.market ?? d.marketAddress,
+    resolvedTokenMint:     d.tokenMint     ?? d.mint ?? d.underlyingMint ?? d.underlyingTokenMint,
+    resolvedTokenSymbol:   d.tokenSymbol   ?? d.symbol ?? d.tokenName ?? d.name,
+  }
+}
+
+/**
+ * Multi-strategy reserve stats fetch for a K-Vault:
+ * 1. Call /kvaults/{addr} — may return supply/borrow directly, or a marketPubkey
+ * 2. If we get a marketPubkey, call fetchReserveMetrics() and find our reserve
+ * 3. reservePubkeyHint (from on-chain decode) helps us find the right reserve in step 2
+ */
+async function fetchVaultReserveStats(
+  vaultAddress: string,
+  reservePubkeyHint?: string
+): Promise<VaultReserveStats> {
+  const empty: VaultReserveStats = {
+    totalSupplyUsd: 0, totalBorrowUsd: 0, reserveUtilization: 0,
+  }
+
+  try {
+    const res = await fetch(`${BASE}/kvaults/${vaultAddress}`)
+    if (res.ok) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const d: Record<string, any> = await res.json()
-      const supply = Number(
-        d.totalSupplyUsd ?? d.totalDeposited ?? d.totalSupplied ??
-        d.tvl ?? d.totalLiquidity ?? d.totalValueLocked ?? 0
-      )
-      const borrow = Number(
-        d.totalBorrowUsd ?? d.totalBorrowed ?? d.totalBorrows ?? d.totalDebt ?? 0
-      )
-      let util = Number(
-        d.utilizationRatio ?? d.utilizationRate ?? d.utilization ??
-        d.reserveUtilization ?? d.borrowUtilization ?? d.utilizationPct ?? 0
-      )
-      if (util === 0 && supply > 0 && borrow > 0) util = Math.min(borrow / supply, 1)
-      if (util > 1) util = util / 100
-      if (supply > 0 || util > 0) return { totalSupplyUsd: supply, totalBorrowUsd: borrow, reserveUtilization: util }
-    } catch { /* try next */ }
-  }
+      const extracted = extractReserveStatsFromObj(d)
+
+      // If direct stats are present, return them
+      if ((extracted.totalSupplyUsd ?? 0) > 0 || (extracted.reserveUtilization ?? 0) > 0) {
+        return { totalSupplyUsd: 0, totalBorrowUsd: 0, reserveUtilization: 0, ...extracted } as VaultReserveStats
+      }
+
+      // If we got a market pubkey, fetch reserve metrics for that specific market
+      const marketKey = extracted.resolvedMarketPubkey
+      if (marketKey) {
+        try {
+          const reserves = await fetchReserveMetrics(marketKey)
+          const rpk = reservePubkeyHint ?? extracted.resolvedReservePubkey
+          const found = rpk
+            ? reserves.find(r => r.reserve === rpk)
+            : reserves.sort((a, b) => Number(b.totalSupplyUsd ?? 0) - Number(a.totalSupplyUsd ?? 0))[0]
+
+          if (found) {
+            const u = extractUtilization(found)
+            return {
+              totalSupplyUsd:       Number(found.totalSupplyUsd ?? 0),
+              totalBorrowUsd:       Number(found.totalBorrowUsd ?? 0),
+              reserveUtilization:   u,
+              resolvedReservePubkey: found.reserve ?? rpk,
+              resolvedMarketPubkey: marketKey,
+              resolvedTokenMint:    found.liquidityTokenMint ?? extracted.resolvedTokenMint,
+              resolvedTokenSymbol:  found.liquidityToken ?? found.symbol ?? extracted.resolvedTokenSymbol,
+            }
+          }
+        } catch { /* fall through */ }
+      }
+
+      // No supply data but we may have structural info — return what we have
+      return { totalSupplyUsd: 0, totalBorrowUsd: 0, reserveUtilization: 0, ...extracted } as VaultReserveStats
+    }
+  } catch { /* fall through */ }
+
   return empty
 }
 
@@ -416,31 +472,42 @@ export async function fetchUserVaultPositions(
     positions.map(async (pos) => {
       if (!pos.vaultAddress) return pos
 
-      const [metrics, tokenInfo, vaultStats] = await Promise.all([
+      // Wave 1: metrics + on-chain token info in parallel
+      const [metrics, tokenInfo] = await Promise.all([
         fetchVaultMetrics(pos.vaultAddress),
         fetchVaultTokenInfo(pos.vaultAddress),
-        fetchVaultReserveStats(pos.vaultAddress),
       ])
+
+      // Wave 2: reserve stats — pass on-chain reserve pubkey as hint so we
+      // can find the exact reserve when the vault API returns a market key
+      const vaultStats = await fetchVaultReserveStats(
+        pos.vaultAddress,
+        tokenInfo?.reservePubkey
+      )
 
       const totalShares = Number(pos.totalShares ?? 0)
 
-      // Resolve token symbol: registry (by reserve) → registry (by mint) → known mints map
+      // Resolve token symbol:
+      // 1. Registry by reserve pubkey (most reliable)
+      // 2. Registry by mint
+      // 3. Well-known mints map (fallback for curated vaults not in registry)
+      // 4. Symbol returned by vault API
+      const resolvedReservePubkey = tokenInfo?.reservePubkey ?? vaultStats.resolvedReservePubkey
+      const resolvedTokenMint     = tokenInfo?.tokenMint     ?? vaultStats.resolvedTokenMint
       let tokenSymbol: string | undefined
-      if (tokenInfo) {
-        if (registry) {
-          const byReserve = registry[tokenInfo.reservePubkey]
-          if (byReserve) {
-            tokenSymbol = byReserve.symbol
-          } else {
-            const byMint = Object.values(registry).find(r => r.mint === tokenInfo.tokenMint)
-            tokenSymbol = byMint?.symbol
-          }
-        }
-        if (!tokenSymbol) tokenSymbol = KNOWN_MINTS[tokenInfo.tokenMint]
+      if (resolvedReservePubkey && registry) {
+        tokenSymbol = registry[resolvedReservePubkey]?.symbol
       }
+      if (!tokenSymbol && resolvedTokenMint && registry) {
+        tokenSymbol = Object.values(registry).find(r => r.mint === resolvedTokenMint)?.symbol
+      }
+      if (!tokenSymbol && resolvedTokenMint) {
+        tokenSymbol = KNOWN_MINTS[resolvedTokenMint]
+      }
+      if (!tokenSymbol) tokenSymbol = vaultStats.resolvedTokenSymbol
 
-      // Reserve-level stats: vault base endpoint → metrics API → registry
-      const reserveInfo = registry && tokenInfo ? registry[tokenInfo.reservePubkey] : undefined
+      // Reserve-level stats: vault API (two-step) → metrics API → registry
+      const reserveInfo = registry && resolvedReservePubkey ? registry[resolvedReservePubkey] : undefined
       const reserveTotalSupplyUsd = vaultStats.totalSupplyUsd || metrics.totalSupplyUsd || reserveInfo?.totalSupplyUsd || 0
       const reserveTotalBorrowUsd = vaultStats.totalBorrowUsd || metrics.totalBorrowUsd || reserveInfo?.totalBorrowUsd || 0
       const reserveUtilization    = vaultStats.reserveUtilization || metrics.reserveUtilization || reserveInfo?.utilization || 0
@@ -451,9 +518,9 @@ export async function fetchUserVaultPositions(
         totalValueUsd:        totalShares * metrics.sharePrice,
         tokenPrice:           metrics.tokenPrice,
         tokenType:            metrics.tokenType,
-        tokenMint:            tokenInfo?.tokenMint,
+        tokenMint:            resolvedTokenMint,
         tokenSymbol,
-        reservePubkey:        tokenInfo?.reservePubkey,
+        reservePubkey:        resolvedReservePubkey,
         tokensAvailable:      metrics.tokensAvailable,
         tokensAvailableUsd:   metrics.tokensAvailableUsd,
         tokensInvested:       metrics.tokensInvested,

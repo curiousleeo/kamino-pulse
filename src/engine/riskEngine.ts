@@ -298,38 +298,48 @@ export function scoreNetworkRisk(p: {
   const signals: RiskSignal[] = []
 
   // TPS — low TPS means txs won't land, can't save position from liquidation
-  const tpsStatus: SignalStatus =
-    p.tps < 800 ? 'red'
-    : p.tps < 1500 ? 'orange'
-    : p.tps < 2500 ? 'yellow'
-    : 'green'
-
-  signals.push({
-    label: 'Solana TPS',
-    value: `${Math.round(p.tps).toLocaleString()} tx/s`,
-    status: tpsStatus,
-    detail:
-      tpsStatus !== 'green'
+  // If TPS = 0 it means the RPC call returned no data (likely rate-limited
+  // on the public endpoint) — treat as unknown, not Critical
+  if (p.tps === 0) {
+    signals.push({
+      label: 'Solana TPS',
+      value: 'Unavailable',
+      status: 'yellow',
+      detail: 'TPS data not returned by RPC — add a VITE_HELIUS_API_KEY for reliable network data',
+    })
+  } else {
+    const tpsStatus: SignalStatus =
+      p.tps < 800 ? 'red'
+      : p.tps < 1500 ? 'orange'
+      : p.tps < 2500 ? 'yellow'
+      : 'green'
+    signals.push({
+      label: 'Solana TPS',
+      value: `${Math.round(p.tps).toLocaleString()} tx/s`,
+      status: tpsStatus,
+      detail: tpsStatus !== 'green'
         ? 'Network congested — time-sensitive txs may fail or delay'
         : 'Network healthy',
-  })
+    })
+  }
 
   // Priority fee — spike = congestion, costs more to land urgent txs
-  const feeStatus: SignalStatus =
-    p.avgPriorityFee > 200_000 ? 'red'
-    : p.avgPriorityFee > 50_000 ? 'orange'
-    : p.avgPriorityFee > 10_000 ? 'yellow'
-    : 'green'
-
-  signals.push({
-    label: 'Avg Priority Fee',
-    value: `${Math.round(p.avgPriorityFee).toLocaleString()} μLamports`,
-    status: feeStatus,
-    detail:
-      feeStatus !== 'green'
+  // Skip if fee is 0 (no data from RPC — not a signal)
+  if (p.avgPriorityFee > 0) {
+    const feeStatus: SignalStatus =
+      p.avgPriorityFee > 200_000 ? 'red'
+      : p.avgPriorityFee > 50_000 ? 'orange'
+      : p.avgPriorityFee > 10_000 ? 'yellow'
+      : 'green'
+    signals.push({
+      label: 'Avg Priority Fee',
+      value: `${Math.round(p.avgPriorityFee).toLocaleString()} μLamports`,
+      status: feeStatus,
+      detail: feeStatus !== 'green'
         ? 'Elevated fees to land transactions — add priority fee if saving a position'
         : 'Normal fee environment',
-  })
+    })
+  }
 
   return {
     id: 'network',
