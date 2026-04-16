@@ -154,6 +154,10 @@ export interface KaminoVaultPosition {
   apy30d?: number              // 30-day APY
   apyFarmRewards?: number      // additional farm/incentive rewards APY
   numberOfHolders?: number
+  // Reserve-level stats (from vault metrics API or registry)
+  reserveTotalSupplyUsd?: number
+  reserveTotalBorrowUsd?: number
+  reserveUtilization?: number  // 0–1
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -281,6 +285,11 @@ interface VaultMetrics {
   apy30d: number
   apyFarmRewards: number
   numberOfHolders: number
+  // Reserve-level stats — populated when the vault metrics API returns them
+  // (curated vaults like Sentora expose these; fallback to 0 if not present)
+  totalSupplyUsd: number
+  totalBorrowUsd: number
+  reserveUtilization: number  // 0–1
 }
 
 async function fetchVaultMetrics(vaultAddress: string): Promise<VaultMetrics> {
@@ -288,6 +297,7 @@ async function fetchVaultMetrics(vaultAddress: string): Promise<VaultMetrics> {
     sharePrice: 1, tokenPrice: 0, tokenType: 'unknown',
     tokensAvailable: 0, tokensAvailableUsd: 0, tokensInvested: 0,
     apy: 0, apy7d: 0, apy30d: 0, apyFarmRewards: 0, numberOfHolders: 0,
+    totalSupplyUsd: 0, totalBorrowUsd: 0, reserveUtilization: 0,
   }
   try {
     const res = await fetch(`${BASE}/kvaults/${vaultAddress}/metrics`)
@@ -301,22 +311,54 @@ async function fetchVaultMetrics(vaultAddress: string): Promise<VaultMetrics> {
       : tokenPrice > 0 ? 'volatile'
       : 'unknown'
 
+    // Try every field name the API might use for reserve-level supply/borrow
+    const totalSupplyUsd = Number(
+      d.totalSupplyUsd ?? d.totalDeposited ?? d.totalSupplied ?? d.tvl ?? 0
+    )
+    const totalBorrowUsd = Number(
+      d.totalBorrowUsd ?? d.totalBorrowed ?? d.totalBorrows ?? d.totalDebt ?? 0
+    )
+    // Utilization: prefer explicit ratio, fall back to borrow/supply calc
+    let reserveUtilization = Number(
+      d.utilizationRatio ?? d.utilizationRate ?? d.utilization ??
+      d.reserveUtilization ?? d.borrowUtilization ?? 0
+    )
+    if (reserveUtilization === 0 && totalSupplyUsd > 0 && totalBorrowUsd > 0) {
+      reserveUtilization = Math.min(totalBorrowUsd / totalSupplyUsd, 1)
+    }
+    if (reserveUtilization > 1) reserveUtilization = reserveUtilization / 100
+
     return {
-      sharePrice:       Number(d.sharePrice ?? 1),
+      sharePrice:         Number(d.sharePrice ?? 1),
       tokenPrice,
       tokenType,
       tokensAvailable:    Number(d.tokensAvailable ?? 0),
       tokensAvailableUsd: Number(d.tokensAvailableUsd ?? 0),
       tokensInvested:     Number(d.tokensInvested ?? 0),
-      apy:            Number(d.apy ?? 0),
-      apy7d:          Number(d.apy7d ?? 0),
-      apy30d:         Number(d.apy30d ?? 0),
-      apyFarmRewards: Number(d.apyFarmRewards ?? 0),
-      numberOfHolders: Number(d.numberOfHolders ?? 0),
+      apy:                Number(d.apy ?? 0),
+      apy7d:              Number(d.apy7d ?? 0),
+      apy30d:             Number(d.apy30d ?? 0),
+      apyFarmRewards:     Number(d.apyFarmRewards ?? 0),
+      numberOfHolders:    Number(d.numberOfHolders ?? 0),
+      totalSupplyUsd,
+      totalBorrowUsd,
+      reserveUtilization,
     }
   } catch {
     return defaults
   }
+}
+
+// Well-known mint → symbol fallback for vaults in curated markets not in registry
+const KNOWN_MINTS: Record<string, string> = {
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+  '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo': 'PYUSD',
+  'USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA':  'USDS',
+  'So11111111111111111111111111111111111111112':    'SOL',
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn': 'jitoSOL',
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So':  'mSOL',
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1':  'bSOL',
 }
 
 export async function fetchUserVaultPositions(
@@ -341,36 +383,47 @@ export async function fetchUserVaultPositions(
 
       const totalShares = Number(pos.totalShares ?? 0)
 
-      // Resolve token symbol from registry using reserve pubkey (most reliable)
-      // Fall back to mint lookup if reserve not in registry
+      // Resolve token symbol: registry (by reserve) → registry (by mint) → known mints map
       let tokenSymbol: string | undefined
-      if (tokenInfo && registry) {
-        const byReserve = registry[tokenInfo.reservePubkey]
-        if (byReserve) {
-          tokenSymbol = byReserve.symbol
-        } else {
-          const byMint = Object.values(registry).find(r => r.mint === tokenInfo.tokenMint)
-          tokenSymbol = byMint?.symbol
+      if (tokenInfo) {
+        if (registry) {
+          const byReserve = registry[tokenInfo.reservePubkey]
+          if (byReserve) {
+            tokenSymbol = byReserve.symbol
+          } else {
+            const byMint = Object.values(registry).find(r => r.mint === tokenInfo.tokenMint)
+            tokenSymbol = byMint?.symbol
+          }
         }
+        if (!tokenSymbol) tokenSymbol = KNOWN_MINTS[tokenInfo.tokenMint]
       }
+
+      // Reserve-level stats: prefer vault metrics API, fall back to registry
+      const reserveInfo = registry && tokenInfo ? registry[tokenInfo.reservePubkey] : undefined
+      const reserveTotalSupplyUsd = metrics.totalSupplyUsd || reserveInfo?.totalSupplyUsd || 0
+      const reserveTotalBorrowUsd = metrics.totalBorrowUsd || reserveInfo?.totalBorrowUsd || 0
+      const reserveUtilization    = metrics.reserveUtilization || reserveInfo?.utilization || 0
 
       return {
         ...pos,
-        sharePrice:        metrics.sharePrice,
-        totalValueUsd:     totalShares * metrics.sharePrice,
-        tokenPrice:        metrics.tokenPrice,
-        tokenType:         metrics.tokenType,
-        tokenMint:         tokenInfo?.tokenMint,
+        sharePrice:           metrics.sharePrice,
+        totalValueUsd:        totalShares * metrics.sharePrice,
+        tokenPrice:           metrics.tokenPrice,
+        tokenType:            metrics.tokenType,
+        tokenMint:            tokenInfo?.tokenMint,
         tokenSymbol,
-        reservePubkey:     tokenInfo?.reservePubkey,
-        tokensAvailable:    metrics.tokensAvailable,
-        tokensAvailableUsd: metrics.tokensAvailableUsd,
-        tokensInvested:     metrics.tokensInvested,
-        apy:               metrics.apy,
-        apy7d:             metrics.apy7d,
-        apy30d:            metrics.apy30d,
-        apyFarmRewards:    metrics.apyFarmRewards,
-        numberOfHolders:   metrics.numberOfHolders,
+        reservePubkey:        tokenInfo?.reservePubkey,
+        tokensAvailable:      metrics.tokensAvailable,
+        tokensAvailableUsd:   metrics.tokensAvailableUsd,
+        tokensInvested:       metrics.tokensInvested,
+        apy:                  metrics.apy,
+        apy7d:                metrics.apy7d,
+        apy30d:               metrics.apy30d,
+        apyFarmRewards:       metrics.apyFarmRewards,
+        numberOfHolders:      metrics.numberOfHolders,
+        reserveTotalSupplyUsd,
+        reserveTotalBorrowUsd,
+        reserveUtilization,
       }
     })
   )
