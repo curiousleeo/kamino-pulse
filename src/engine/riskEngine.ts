@@ -30,42 +30,17 @@ function usd(n: number): string {
 // ─── Layer 1 — Protocol Health ───────────────────────────────────────────────
 
 export function scoreProtocolHealth(p: {
-  kaminoTVL: number
-  defillamaTVL: number
-  tvlChange24h: number
+  kaminoTVL: number              // summed from reserve registry (Kamino's own data)
   maxReserveUtilization: number
 }): RiskLayer {
   const signals: RiskSignal[] = []
 
-  // Independent TVL cross-check (Kamino self-reported vs DeFiLlama on-chain)
-  const tvlDev =
-    p.kaminoTVL > 0 && p.defillamaTVL > 0
-      ? Math.abs(p.kaminoTVL - p.defillamaTVL) / Math.max(p.kaminoTVL, p.defillamaTVL)
-      : 0
-
+  // Kamino TVL from reserve registry
   signals.push({
-    label: 'TVL Cross-Check',
-    value: `${usd(p.defillamaTVL)} (DeFiLlama)`,
-    status: thresh(tvlDev, [[0.2, 'red'], [0.1, 'orange'], [0.03, 'yellow']]),
-    detail:
-      tvlDev > 0.03
-        ? `${pct(tvlDev)} deviation between Kamino & DeFiLlama — investigate`
-        : 'Kamino and DeFiLlama TVL consistent',
-  })
-
-  // 24h TVL change — rapid outflow = bank run signal
-  const changeAbs = Math.abs(p.tvlChange24h)
-  const isNeg = p.tvlChange24h < 0
-  signals.push({
-    label: 'TVL 24h Change',
-    value: `${p.tvlChange24h >= 0 ? '+' : ''}${pct(p.tvlChange24h)}`,
-    status: isNeg
-      ? thresh(changeAbs, [[0.25, 'red'], [0.15, 'orange'], [0.05, 'yellow']])
-      : 'green',
-    detail:
-      isNeg && changeAbs > 0.05
-        ? 'Unusual TVL outflow — potential bank run signal'
-        : 'Normal TVL movement',
+    label: 'Kamino TVL',
+    value: usd(p.kaminoTVL),
+    status: 'green',
+    detail: 'Total value locked across all scanned Kamino lending markets',
   })
 
   // Highest reserve utilization across all markets
@@ -74,15 +49,17 @@ export function scoreProtocolHealth(p: {
     value: pct(p.maxReserveUtilization),
     status: thresh(p.maxReserveUtilization, [[0.95, 'red'], [0.9, 'orange'], [0.8, 'yellow']]),
     detail:
-      p.maxReserveUtilization >= 0.8
-        ? 'High utilization — withdrawal liquidity constrained'
+      p.maxReserveUtilization >= 0.95
+        ? 'Near cap — some reserve withdrawals severely constrained'
+        : p.maxReserveUtilization >= 0.8
+        ? 'High utilization in at least one reserve — check Pool Liquidity'
         : 'Liquidity available across reserves',
   })
 
   return {
     id: 'protocol',
     name: 'Protocol Health',
-    description: 'TVL cross-check, reserve utilization, and liquidity depth',
+    description: 'Kamino TVL and reserve utilization across lending markets',
     tier: worst(signals.map(s => s.status)),
     signals,
   }
@@ -149,12 +126,10 @@ export function scoreAssetRisk(p: {
   // Stablecoin peg deviation — check every stablecoin we have a price for.
   // Kamino uses price bands (±1% for pegged assets) as a circuit breaker.
   // We surface smaller deviations so users can react before the band fires.
+  // If price is unavailable, skip the signal — no data is not a risk signal.
   for (const sym of ['USDC', 'USDT', 'PYUSD', 'USDS']) {
     const price = prices[sym]
-    if (price === null || price === undefined) {
-      signals.push({ label: `${sym} Peg`, value: 'N/A', status: 'yellow', detail: 'Price unavailable' })
-      continue
-    }
+    if (price === null || price === undefined) continue
     const dev = Math.abs(price - 1.0)
     signals.push({
       label: `${sym} Peg`,
@@ -367,7 +342,37 @@ export function scoreNetworkRisk(p: {
 
 // ─── Overall score ───────────────────────────────────────────────────────────
 
+/**
+ * Position risk drives the headline — it's the user's actual exposure.
+ * Protocol/oracle/network/asset are context layers that can bump the overall
+ * by at most one tier above the position tier. A lend-only user with no borrow
+ * risk should never see "AT RISK" just because a protocol-wide reserve is high.
+ */
 export function computeOverall(layers: RiskLayer[]): RiskTier {
   const activeLayers = layers.filter(l => l.tier !== 'error' && l.tier !== 'loading')
-  return activeLayers.length > 0 ? worst(activeLayers.map(l => l.tier)) : 'loading'
+  if (activeLayers.length === 0) return 'loading'
+
+  const positionLayer = layers.find(l => l.id === 'position')
+
+  // No position layer (no wallet) — show aggregate protocol health
+  if (!positionLayer || positionLayer.tier === 'loading' || positionLayer.tier === 'error') {
+    return worst(activeLayers.map(l => l.tier))
+  }
+
+  const posTier = positionLayer.tier
+
+  // Orange/red positions are the user's headline risk — show it directly
+  if (posTier === 'orange' || posTier === 'red') return posTier
+
+  // Green/yellow positions: context layers can bump by at most 1 tier
+  // (e.g., network congestion or high protocol utilization is worth noting,
+  //  but shouldn't make a lend-only user's dashboard say "AT RISK")
+  const tierOrder: RiskTier[] = ['green', 'yellow', 'orange', 'red']
+  const posIdx = tierOrder.indexOf(posTier)
+  const contextTiers = activeLayers.filter(l => l.id !== 'position').map(l => l.tier)
+  const contextTier  = contextTiers.length > 0 ? worst(contextTiers) : 'green'
+  const ctxIdx       = tierOrder.indexOf(contextTier)
+  // Allow bumping by at most 1 step above position tier
+  const finalIdx     = Math.max(posIdx, Math.min(posIdx + 1, ctxIdx))
+  return tierOrder[finalIdx]
 }

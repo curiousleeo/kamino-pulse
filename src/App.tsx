@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RiskLayer, RiskTier } from './types'
 import type { KaminoObligation, KaminoVaultPosition, ReserveInfo, ReserveRegistry } from './api/kamino'
 import { LandingHero } from './components/LandingHero'
@@ -11,10 +11,10 @@ import {
   fetchUserObligations,
   fetchUserVaultPositions,
   buildReserveRegistry,
+  computeTVLFromRegistry,
   extractUtilization,
   getMarketKey,
 } from './api/kamino'
-import { fetchKaminoTVL } from './api/defillama'
 import { fetchPythPrices } from './api/pyth'
 import { fetchJupiterPrices } from './api/jupiter'
 import { fetchNetworkHealth } from './api/helius'
@@ -223,6 +223,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [countdown, setCountdown] = useState(REFRESH_MS / 1000)
   const [kaminoTVL, setKaminoTVL] = useState(0)
+  const prevTVLRef = useRef(0)
   const [protocolExpanded, setProtocolExpanded] = useState(false)
   const [registry, setRegistry] = useState<ReserveRegistry>({})
 
@@ -231,22 +232,19 @@ export default function App() {
     const newLayers: RiskLayer[] = []
 
     try {
-      const [marketsRes, defillamaRes, pythRes, jupiterRes, networkRes] =
+      const [marketsRes, pythRes, jupiterRes, networkRes] =
         await Promise.allSettled([
           fetchMarkets(),
-          fetchKaminoTVL(),
           fetchPythPrices(),
           fetchJupiterPrices(),
           fetchNetworkHealth(),
         ])
 
-      const markets    = marketsRes.status    === 'fulfilled' ? marketsRes.value    : []
-      const defillama  = defillamaRes.status  === 'fulfilled' ? defillamaRes.value  : null
-      const pythPrices = pythRes.status       === 'fulfilled' ? pythRes.value       : []
-      const jupPrices  = jupiterRes.status    === 'fulfilled' ? jupiterRes.value    : []
-      const network    = networkRes.status    === 'fulfilled' ? networkRes.value    : null
-
-      if (defillama?.current) setKaminoTVL(defillama.current)
+      const markets    = marketsRes.status === 'fulfilled' ? marketsRes.value : []
+      const pythPrices = pythRes.status    === 'fulfilled' ? pythRes.value    : []
+      const jupPrices  = jupiterRes.status === 'fulfilled' ? jupiterRes.value : []
+      // fetchNetworkHealth never throws — always fulfilled
+      const network    = networkRes.status === 'fulfilled' ? networkRes.value : { tps: 0, avgPriorityFee: 0 }
 
       // Build price map
       const priceMap: Record<string, number | null> = {}
@@ -254,8 +252,6 @@ export default function App() {
       for (const p of jupPrices) if (p.price !== null) priceMap[p.symbol] = p.price
 
       // ── Build reserve registry across all markets ──────────────────────────
-      // Do this in parallel with everything else; used for pool liquidity display
-      // and reserve-by-symbol lookups in ObligationCard
       let newRegistry: ReserveRegistry = {}
       try {
         newRegistry = await buildReserveRegistry(markets)
@@ -266,30 +262,39 @@ export default function App() {
 
       // ── Layer 1: Protocol Health ───────────────────────────────────────────
       try {
+        // TVL from registry — Kamino's own data, no third-party needed
+        const tvlFromRegistry = computeTVLFromRegistry(newRegistry)
+        if (tvlFromRegistry > 0) setKaminoTVL(tvlFromRegistry)
+
+        // Peak utilization: scan registry (already built) + any missing primary markets
         let maxUtil = 0
-        const primaryMarkets = markets.filter(m => m.isPrimary).slice(0, 5)
-        const reserveResults = await Promise.allSettled(
-          primaryMarkets.map(m => fetchReserveMetrics(getMarketKey(m)))
-        )
-        for (const result of reserveResults) {
-          if (result.status !== 'fulfilled') continue
-          for (const r of result.value) {
-            const supplyUsd = Number(r.totalSupplyUsd ?? 0)
-            if (supplyUsd < 1_000_000) continue
-            const u = extractUtilization(r)
-            if (u > maxUtil) maxUtil = u
+        for (const r of Object.values(newRegistry)) {
+          if (r.utilization > maxUtil) maxUtil = r.utilization
+        }
+        // If registry was empty, fall back to fetching primary markets directly
+        if (Object.keys(newRegistry).length === 0) {
+          const primaryMarkets = markets.filter(m => m.isPrimary).slice(0, 5)
+          const reserveResults = await Promise.allSettled(
+            primaryMarkets.map(m => fetchReserveMetrics(getMarketKey(m)))
+          )
+          for (const result of reserveResults) {
+            if (result.status !== 'fulfilled') continue
+            for (const r of result.value) {
+              const supplyUsd = Number(r.totalSupplyUsd ?? 0)
+              if (supplyUsd < 1_000_000) continue
+              const u = extractUtilization(r)
+              if (u > maxUtil) maxUtil = u
+            }
           }
         }
         newLayers.push(
           scoreProtocolHealth({
-            kaminoTVL:             defillama?.current ?? 0,
-            defillamaTVL:          defillama?.current ?? 0,
-            tvlChange24h:          defillama?.change24h ?? 0,
+            kaminoTVL:             tvlFromRegistry || kaminoTVL,
             maxReserveUtilization: maxUtil,
           })
         )
       } catch (e) {
-        newLayers.push(errorLayer('protocol', 'Protocol Health', 'TVL, reserve utilization, and liquidity depth', String(e)))
+        newLayers.push(errorLayer('protocol', 'Protocol Health', 'Kamino TVL and reserve utilization', String(e)))
       }
 
       // ── Layer 2: Oracle Risk ───────────────────────────────────────────────
@@ -336,12 +341,9 @@ export default function App() {
       }
 
       // ── Layer 5: Network Risk ──────────────────────────────────────────────
+      // fetchNetworkHealth never throws; network is always a valid object
       try {
-        if (network) {
-          newLayers.push(scoreNetworkRisk({ tps: network.tps, avgPriorityFee: network.avgPriorityFee }))
-        } else {
-          throw new Error('Network data unavailable')
-        }
+        newLayers.push(scoreNetworkRisk({ tps: network.tps, avgPriorityFee: network.avgPriorityFee }))
       } catch (e) {
         newLayers.push(errorLayer('network', 'Network Risk', 'Solana TPS, congestion, and priority fee environment', String(e)))
       }

@@ -98,27 +98,30 @@ export interface NetworkHealth {
 }
 
 export async function fetchNetworkHealth(): Promise<NetworkHealth> {
-  const [perfSamples, priorityFees] = await Promise.all([
+  // Use allSettled so one failing RPC call doesn't kill the whole fetch
+  const [perfResult, feeResult] = await Promise.allSettled([
     rpc('getRecentPerformanceSamples', [10]),
     rpc('getRecentPrioritizationFees', []),
   ])
 
   let tps = 0
-  if (Array.isArray(perfSamples) && perfSamples.length > 0) {
-    const valid = perfSamples.filter(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (s: any) => s.samplePeriodSecs > 0
-    )
+  if (perfResult.status === 'fulfilled' && Array.isArray(perfResult.value)) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const tpsValues = valid.map((s: any) => s.numTransactions / s.samplePeriodSecs)
-    tps = tpsValues.reduce((a: number, b: number) => a + b, 0) / tpsValues.length
+    const valid = perfResult.value.filter((s: any) => s.samplePeriodSecs > 0)
+    if (valid.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const tpsValues = valid.map((s: any) => s.numTransactions / s.samplePeriodSecs)
+      tps = tpsValues.reduce((a: number, b: number) => a + b, 0) / tpsValues.length
+    }
   }
 
   let avgPriorityFee = 0
-  if (Array.isArray(priorityFees) && priorityFees.length > 0) {
+  if (feeResult.status === 'fulfilled' && Array.isArray(feeResult.value)) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const fees = priorityFees.map((f: any) => Number(f.prioritizationFee))
-    avgPriorityFee = fees.reduce((a: number, b: number) => a + b, 0) / fees.length
+    const fees = feeResult.value.map((f: any) => Number(f.prioritizationFee))
+    if (fees.length > 0) {
+      avgPriorityFee = fees.reduce((a: number, b: number) => a + b, 0) / fees.length
+    }
   }
 
   return { tps, avgPriorityFee }
