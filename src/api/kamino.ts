@@ -139,6 +139,16 @@ export interface KaminoVaultPosition {
   // enriched after fetching vault metrics
   totalValueUsd?: number
   sharePrice?: number
+  tokenPrice?: number          // underlying token USD price — ≈1.00 = stablecoin
+  tokenType?: 'stablecoin' | 'volatile' | 'unknown'
+  tokensAvailable?: number     // tokens in vault buffer available to withdraw NOW
+  tokensAvailableUsd?: number
+  tokensInvested?: number      // tokens deployed into lending market
+  apy?: number                 // current base APY (0–1)
+  apy7d?: number               // 7-day APY
+  apy30d?: number              // 30-day APY
+  apyFarmRewards?: number      // additional farm/incentive rewards APY
+  numberOfHolders?: number
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -254,14 +264,53 @@ export async function fetchUserObligations(
   }))
 }
 
-async function fetchVaultSharePrice(vaultAddress: string): Promise<number> {
+interface VaultMetrics {
+  sharePrice: number
+  tokenPrice: number
+  tokenType: 'stablecoin' | 'volatile' | 'unknown'
+  tokensAvailable: number
+  tokensAvailableUsd: number
+  tokensInvested: number
+  apy: number
+  apy7d: number
+  apy30d: number
+  apyFarmRewards: number
+  numberOfHolders: number
+}
+
+async function fetchVaultMetrics(vaultAddress: string): Promise<VaultMetrics> {
+  const defaults: VaultMetrics = {
+    sharePrice: 1, tokenPrice: 0, tokenType: 'unknown',
+    tokensAvailable: 0, tokensAvailableUsd: 0, tokensInvested: 0,
+    apy: 0, apy7d: 0, apy30d: 0, apyFarmRewards: 0, numberOfHolders: 0,
+  }
   try {
     const res = await fetch(`${BASE}/kvaults/${vaultAddress}/metrics`)
-    if (!res.ok) return 1
-    const data = await res.json()
-    return Number(data.sharePrice ?? 1)
+    if (!res.ok) return defaults
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const d: Record<string, any> = await res.json()
+
+    const tokenPrice = Number(d.tokenPrice ?? 0)
+    const tokenType: 'stablecoin' | 'volatile' | 'unknown' =
+      tokenPrice >= 0.95 && tokenPrice <= 1.05 ? 'stablecoin'
+      : tokenPrice > 0 ? 'volatile'
+      : 'unknown'
+
+    return {
+      sharePrice:       Number(d.sharePrice ?? 1),
+      tokenPrice,
+      tokenType,
+      tokensAvailable:    Number(d.tokensAvailable ?? 0),
+      tokensAvailableUsd: Number(d.tokensAvailableUsd ?? 0),
+      tokensInvested:     Number(d.tokensInvested ?? 0),
+      apy:            Number(d.apy ?? 0),
+      apy7d:          Number(d.apy7d ?? 0),
+      apy30d:         Number(d.apy30d ?? 0),
+      apyFarmRewards: Number(d.apyFarmRewards ?? 0),
+      numberOfHolders: Number(d.numberOfHolders ?? 0),
+    }
   } catch {
-    return 1
+    return defaults
   }
 }
 
@@ -275,12 +324,22 @@ export async function fetchUserVaultPositions(wallet: string): Promise<KaminoVau
   const enriched = await Promise.allSettled(
     positions.map(async (pos) => {
       if (!pos.vaultAddress) return pos
-      const sharePrice = await fetchVaultSharePrice(pos.vaultAddress)
+      const metrics = await fetchVaultMetrics(pos.vaultAddress)
       const totalShares = Number(pos.totalShares ?? 0)
       return {
         ...pos,
-        sharePrice,
-        totalValueUsd: totalShares * sharePrice,
+        sharePrice:       metrics.sharePrice,
+        totalValueUsd:    totalShares * metrics.sharePrice,
+        tokenPrice:       metrics.tokenPrice,
+        tokenType:        metrics.tokenType,
+        tokensAvailable:    metrics.tokensAvailable,
+        tokensAvailableUsd: metrics.tokensAvailableUsd,
+        tokensInvested:     metrics.tokensInvested,
+        apy:            metrics.apy,
+        apy7d:          metrics.apy7d,
+        apy30d:         metrics.apy30d,
+        apyFarmRewards: metrics.apyFarmRewards,
+        numberOfHolders: metrics.numberOfHolders,
       }
     })
   )
