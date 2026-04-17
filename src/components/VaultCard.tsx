@@ -31,6 +31,11 @@ export function VaultCard({ position, index }: Props) {
   const deployedRatio   = vaultTvl > 0 ? Math.min((vaultTvl - availableUsd) / vaultTvl, 1) : 0
   const availablePct    = vaultTvl > 0 ? ((availableUsd / vaultTvl) * 100).toFixed(1) : null
 
+  // Reserve-level stats — the underlying lending reserve this vault deploys into
+  const totalBorrowUsd    = position.reserveTotalBorrowUsd ?? 0
+  const utilization       = position.reserveUtilization ?? 0
+  const utilizationColor  = utilization >= 0.92 ? '#ef4444' : utilization >= 0.82 ? '#f97316' : utilization >= 0.72 ? '#f59e0b' : '#10b981'
+
   // Yield — current live rate (apy = current, NOT 7d average)
   const apyBase  = position.apy ?? 0
   const apyFarm  = position.apyFarmRewards ?? 0
@@ -139,6 +144,30 @@ export function VaultCard({ position, index }: Props) {
                 {availablePct !== null && (
                   <p className="text-[10px] text-slate-700 mt-0.5">{availablePct}% of TVL</p>
                 )}
+              </div>
+            </div>
+
+            {/* Total Borrowed + Utilization side by side */}
+            <div className="grid grid-cols-2 gap-3">
+              <div
+                className="rounded-xl px-4 py-3"
+                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
+              >
+                <p className="text-[10px] text-slate-600 mb-1">Total Borrowed</p>
+                <p className="text-base font-black text-slate-200">
+                  {totalBorrowUsd > 0 ? fmtUsd(totalBorrowUsd) : '—'}
+                </p>
+                {totalBorrowUsd > 0 && <p className="text-[10px] text-slate-700 mt-0.5">reserve debt</p>}
+              </div>
+              <div
+                className="rounded-xl px-4 py-3"
+                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)' }}
+              >
+                <p className="text-[10px] text-slate-600 mb-1">Utilization</p>
+                <p className="text-base font-black" style={{ color: utilization > 0 ? utilizationColor : '#f1f5f9' }}>
+                  {utilization > 0 ? `${(utilization * 100).toFixed(1)}%` : '—'}
+                </p>
+                {utilization > 0 && <p className="text-[10px] text-slate-700 mt-0.5">of reserve</p>}
               </div>
             </div>
 
