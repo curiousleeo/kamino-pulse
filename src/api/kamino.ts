@@ -518,15 +518,27 @@ export async function fetchUserVaultPositions(
       const tokenPrice  = metrics.tokenPrice > 0 ? metrics.tokenPrice : 1
 
       if (allocations.length > 0 && registry) {
+        // Primary path: on-chain allocations × reserve utilization per market
         for (const alloc of allocations) {
           const reserveInfo = registry[alloc.reserve]
           if (!reserveInfo) continue
           const allocUsd = alloc.tokenAmount * tokenPrice
           reserveTotalBorrowUsd += allocUsd * reserveInfo.utilization
         }
-      } else {
-        // Fallback: two-step vault API → registry
-        reserveTotalBorrowUsd = vaultStats.totalBorrowUsd || metrics.totalBorrowUsd || 0
+      } else if (registry && resolvedTokenMint) {
+        // Fallback: on-chain decode failed (RPC rate-limited) — aggregate all
+        // reserves matching the vault's mint. Slightly over-counts if users have
+        // deposited directly into the same reserves, but far better than zero.
+        let aggSupply = 0
+        let aggBorrow = 0
+        for (const r of Object.values(registry)) {
+          if (r.mint === resolvedTokenMint) {
+            aggSupply += r.totalSupplyUsd
+            aggBorrow += r.totalBorrowUsd
+          }
+        }
+        const blendedUtil = aggSupply > 0 ? aggBorrow / aggSupply : 0
+        reserveTotalBorrowUsd = (metrics.totalSupplyUsd || 0) * blendedUtil
       }
 
       const reserveTotalSupplyUsd = metrics.totalSupplyUsd || vaultStats.totalSupplyUsd || 0

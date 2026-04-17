@@ -24,17 +24,18 @@ export function VaultCard({ position, index }: Props) {
   const holders     = position.numberOfHolders ?? 0
 
   // Vault TVL — total capital deployed by this vault into the lending protocol
-  const vaultTvl        = position.vaultTvlUsd ?? 0
-  // Available = idle buffer in the vault (not yet deployed, or freed from reserve)
-  const availableUsd    = position.tokensAvailableUsd ?? 0
-  // Deploy ratio — what % of vault TVL is deployed vs sitting idle
-  const deployedRatio   = vaultTvl > 0 ? Math.min((vaultTvl - availableUsd) / vaultTvl, 1) : 0
-  const availablePct    = vaultTvl > 0 ? ((availableUsd / vaultTvl) * 100).toFixed(1) : null
+  const vaultTvl     = position.vaultTvlUsd ?? 0
+  const totalBorrowUsd = position.reserveTotalBorrowUsd ?? 0
+  const utilization    = position.reserveUtilization ?? 0
 
-  // Reserve-level stats — the underlying lending reserve this vault deploys into
-  const totalBorrowUsd    = position.reserveTotalBorrowUsd ?? 0
-  const utilization       = position.reserveUtilization ?? 0
-  const utilizationColor  = utilization >= 0.92 ? '#ef4444' : utilization >= 0.82 ? '#f97316' : utilization >= 0.72 ? '#f59e0b' : '#10b981'
+  // Available = vault TVL minus what's currently borrowed across all reserves
+  // (how much could be withdrawn at current utilization)
+  const availableUsd = totalBorrowUsd > 0
+    ? Math.max(vaultTvl - totalBorrowUsd, 0)
+    : (position.tokensAvailableUsd ?? 0)
+  const availablePct = vaultTvl > 0 ? ((availableUsd / vaultTvl) * 100).toFixed(1) : null
+
+  const utilizationColor = utilization >= 0.92 ? '#ef4444' : utilization >= 0.82 ? '#f97316' : utilization >= 0.72 ? '#f59e0b' : '#10b981'
 
   // Yield — current live rate (apy = current, NOT 7d average)
   const apyBase  = position.apy ?? 0
