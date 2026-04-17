@@ -43,8 +43,9 @@ export function VaultCard({ position, index }: Props) {
   const apyTotal = apyBase + apyFarm
 
   // Estimated earnings from user's position
-  const earnPerYear = value * apyTotal
-  const earnPerDay  = earnPerYear / 365
+  const earnPerYear  = value * apyTotal
+  const earnPerMonth = earnPerYear / 12
+  const earnPerDay   = earnPerYear / 365
 
   // Stablecoin peg deviation
   const pegDeviation = tokenType === 'stablecoin' && tokenPrice
@@ -233,6 +234,12 @@ export function VaultCard({ position, index }: Props) {
                     {fmtUsd(earnPerYear)}
                   </span>
                   <span className="text-[10px] text-slate-600"> / year</span>
+                </div>
+                <div>
+                  <span className="text-sm font-bold text-slate-300">
+                    {fmtUsd(earnPerMonth)}
+                  </span>
+                  <span className="text-[10px] text-slate-600"> / mo</span>
                 </div>
                 <div>
                   <span className="text-sm font-bold text-slate-400">
