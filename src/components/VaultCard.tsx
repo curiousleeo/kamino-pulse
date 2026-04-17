@@ -251,6 +251,41 @@ export function VaultCard({ position, index }: Props) {
               {' '}+ {(apyBase * 100).toFixed(2)}% base lending yield
             </p>
           )}
+
+          {/* ── Personal withdrawal risk ── */}
+          {value > 0 && availableUsd > 0 && (() => {
+            const coverage = availableUsd / value
+            const positionPct = vaultTvl > 0 ? (value / vaultTvl) * 100 : 0
+            const [signal, signalColor] =
+              coverage >= 10  ? ['Exit instantly — deep liquidity'     , '#34d399'] :
+              coverage >= 3   ? ['Low risk — ample liquidity'          , '#a3e635'] :
+              coverage >= 1   ? ['Monitor — liquidity tightening'      , '#f59e0b'] :
+                                ['Caution — liquidity below position'  , '#ef4444']
+            return (
+              <div
+                className="mt-3 pt-3 space-y-2"
+                style={{ borderTop: '1px solid rgba(139,92,246,0.1)' }}
+              >
+                <div className="flex items-center justify-between">
+                  <p className="text-[10px] text-slate-600">Withdrawal risk</p>
+                  <span className="text-[10px] font-bold" style={{ color: signalColor }}>
+                    {signal}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-[10px]">
+                  <span className="text-slate-700">
+                    Your {fmtUsd(value)} vs {fmtUsd(availableUsd)} available
+                  </span>
+                  <span className="text-slate-600">
+                    {coverage >= 10
+                      ? `${coverage.toFixed(0)}× your position`
+                      : `${coverage.toFixed(1)}× your position`}
+                    {positionPct > 0 && ` · ${positionPct < 0.01 ? '<0.01' : positionPct.toFixed(2)}% of vault`}
+                  </span>
+                </div>
+              </div>
+            )
+          })()}
         </div>
 
         {/* ── Token peg (stablecoin only, and only if notable deviation) ── */}

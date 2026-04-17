@@ -32,6 +32,7 @@ function usd(n: number): string {
 export function scoreProtocolHealth(p: {
   kaminoTVL: number              // summed from reserve registry (Kamino's own data)
   maxReserveUtilization: number
+  userVaultUtilization?: number  // blended utilization across user's vault allocations
 }): RiskLayer {
   const signals: RiskSignal[] = []
 
@@ -43,7 +44,42 @@ export function scoreProtocolHealth(p: {
     detail: 'Total value locked across all scanned Kamino lending markets',
   })
 
-  // Highest reserve utilization across all markets
+  if (p.userVaultUtilization !== undefined) {
+    // User has vault positions — show their blended utilization as the primary signal.
+    // Kamino-wide peak is still shown for context but does not drive the layer tier.
+    const u = p.userVaultUtilization
+    signals.push({
+      label: 'Your Vault Utilization',
+      value: pct(u),
+      status: thresh(u, [[0.95, 'red'], [0.9, 'orange'], [0.8, 'yellow']]),
+      detail:
+        u >= 0.95
+          ? "Near cap — your vault's liquidity is severely constrained, monitor withdrawal availability"
+          : u >= 0.8
+          ? "High utilization — watch your vault's available liquidity"
+          : "Your vault's liquidity is healthy",
+    })
+    // Protocol-wide peak: context only — high Kamino utilization in an unrelated reserve
+    // shouldn't alarm a user whose own vault is fine.
+    const kPeak = p.maxReserveUtilization
+    signals.push({
+      label: 'Kamino Peak (context)',
+      value: pct(kPeak),
+      status: thresh(kPeak, [[0.95, 'red'], [0.9, 'orange'], [0.8, 'yellow']]),
+      detail: 'Highest utilization across all $1M+ Kamino reserves — protocol-wide context, may not affect your vault',
+    })
+    // Tier is driven by TVL + user vault signals only; Kamino peak is context
+    const tierSignals = signals.filter(s => s.label !== 'Kamino Peak (context)')
+    return {
+      id: 'protocol',
+      name: 'Protocol Health',
+      description: "Kamino TVL and your vault's utilization across allocated markets",
+      tier: worst(tierSignals.map(s => s.status)),
+      signals,
+    }
+  }
+
+  // No user vault context — show Kamino-wide peak as primary
   signals.push({
     label: 'Peak Reserve Utilization',
     value: pct(p.maxReserveUtilization),
@@ -188,6 +224,9 @@ export function scorePositionRisk(p: {
     stakedShares?: string | number
     totalValueUsd?: number
     sharePrice?: number
+    reserveUtilization?: number
+    vaultTvlUsd?: number
+    reserveTotalBorrowUsd?: number
     // legacy fields
     totalValue?: number
     symbol?: string
@@ -265,17 +304,41 @@ export function scorePositionRisk(p: {
 
   for (const pos of p.vaultPositions) {
     const totalShares = Number(pos.totalShares ?? pos.sharesAmount ?? 0)
-    if (totalShares > 0) {
-      const addr = (pos.vaultAddress as string | undefined) ?? ''
-      const shortAddr = addr ? `${addr.slice(0, 4)}…${addr.slice(-4)}` : 'K-Vault'
-      const value = (pos as { totalValueUsd?: number }).totalValueUsd
+    if (totalShares <= 0) continue
+
+    const addr      = pos.vaultAddress ?? ''
+    const shortAddr = addr ? `${addr.slice(0, 4)}…${addr.slice(-4)}` : 'K-Vault'
+    const value     = pos.totalValueUsd
+    const util      = pos.reserveUtilization ?? 0
+    const tvl       = pos.vaultTvlUsd ?? 0
+    const borrowed  = pos.reserveTotalBorrowUsd ?? 0
+    const available = tvl > 0 && borrowed > 0 ? Math.max(tvl - borrowed, 0) : 0
+    const coverage  = value && value > 0 && available > 0 ? available / value : null
+
+    signals.push({
+      label: `K-Vault ${shortAddr}`,
+      value: value !== undefined ? usd(value) : `${totalShares.toLocaleString(undefined, { maximumFractionDigits: 2 })} shares`,
+      status: 'green',
+      detail: value !== undefined
+        ? `${totalShares.toLocaleString(undefined, { maximumFractionDigits: 2 })} shares · no liquidation risk`
+        : 'K-Vault earn position — no liquidation risk',
+    })
+
+    if (util > 0) {
+      const utilStatus = thresh(util, [[0.95, 'red'], [0.9, 'orange'], [0.8, 'yellow']])
+      const coverageNote = coverage !== null
+        ? ` · ${coverage >= 10 ? coverage.toFixed(0) : coverage.toFixed(1)}× your position available`
+        : ''
       signals.push({
-        label: `K-Vault ${shortAddr}`,
-        value: value !== undefined ? usd(value) : `${totalShares.toLocaleString(undefined, { maximumFractionDigits: 2 })} shares`,
-        status: 'green',
-        detail: value !== undefined
-          ? `${totalShares.toLocaleString(undefined, { maximumFractionDigits: 2 })} shares · no liquidation risk`
-          : 'K-Vault earn position — no liquidation risk',
+        label: 'Vault Utilization',
+        value: pct(util),
+        status: utilStatus,
+        detail:
+          util >= 0.95
+            ? `Near cap — withdrawal may be severely delayed${coverageNote}`
+            : util >= 0.8
+            ? `High — monitor withdrawal availability${coverageNote}`
+            : `Normal — exit liquidity available${coverageNote}`,
       })
     }
   }

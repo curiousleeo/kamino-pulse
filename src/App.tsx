@@ -260,17 +260,20 @@ export default function App() {
         console.warn('[reserve registry]', e)
       }
 
+      // Hoisted so vault-position scoring can re-score Protocol Health with user context
+      let protocolMaxUtil = 0
+      let protocolTvl = 0
+
       // ── Layer 1: Protocol Health ───────────────────────────────────────────
       try {
         // TVL from registry — Kamino's own data, no third-party needed
-        const tvlFromRegistry = computeTVLFromRegistry(newRegistry)
-        if (tvlFromRegistry > 0) setKaminoTVL(tvlFromRegistry)
+        protocolTvl = computeTVLFromRegistry(newRegistry)
+        if (protocolTvl > 0) setKaminoTVL(protocolTvl)
 
         // Peak utilization across significant reserves ($1M+ supply only)
         // Micro reserves often hit 100% from rounding — ignore them for protocol signal
-        let maxUtil = 0
         for (const r of Object.values(newRegistry)) {
-          if (r.totalSupplyUsd >= 1_000_000 && r.utilization > maxUtil) maxUtil = r.utilization
+          if (r.totalSupplyUsd >= 1_000_000 && r.utilization > protocolMaxUtil) protocolMaxUtil = r.utilization
         }
         // If registry was empty, fall back to fetching primary markets directly
         if (Object.keys(newRegistry).length === 0) {
@@ -284,14 +287,14 @@ export default function App() {
               const supplyUsd = Number(r.totalSupplyUsd ?? 0)
               if (supplyUsd < 1_000_000) continue
               const u = extractUtilization(r)
-              if (u > maxUtil) maxUtil = u
+              if (u > protocolMaxUtil) protocolMaxUtil = u
             }
           }
         }
         newLayers.push(
           scoreProtocolHealth({
-            kaminoTVL:             tvlFromRegistry || kaminoTVL,
-            maxReserveUtilization: maxUtil,
+            kaminoTVL:             protocolTvl || kaminoTVL,
+            maxReserveUtilization: protocolMaxUtil,
           })
         )
       } catch (e) {
@@ -335,6 +338,25 @@ export default function App() {
           setObligations(allObligations)
           setVaultPositions(rawVaults)
 
+          // Re-score Protocol Health with user's vault utilization so the layer
+          // reflects their actual exposure, not Kamino-wide worst-case
+          const vaultsWithUtil = rawVaults.filter(v =>
+            Number(v.totalShares ?? 0) > 0 && (v.reserveUtilization ?? 0) > 0
+          )
+          if (vaultsWithUtil.length > 0) {
+            const userVaultUtil =
+              vaultsWithUtil.reduce((sum, v) => sum + (v.reserveUtilization ?? 0), 0) /
+              vaultsWithUtil.length
+            const protoIdx = newLayers.findIndex(l => l.id === 'protocol')
+            if (protoIdx >= 0) {
+              newLayers[protoIdx] = scoreProtocolHealth({
+                kaminoTVL:             protocolTvl || kaminoTVL,
+                maxReserveUtilization: protocolMaxUtil,
+                userVaultUtilization:  userVaultUtil,
+              })
+            }
+          }
+
           newLayers.push(scorePositionRisk({ obligations: allObligations, vaultPositions: rawVaults }))
         } catch (e) {
           newLayers.push(errorLayer('position', 'Position Risk', 'Your health factor, collateral ratio, and vault positions', String(e)))
@@ -375,6 +397,8 @@ export default function App() {
   function handleSearch(w: string) {
     setObligations([])
     setVaultPositions([])
+    setLayers([])
+    setOverall('loading')
     setWallet(w)
   }
 
