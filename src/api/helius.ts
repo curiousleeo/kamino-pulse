@@ -110,11 +110,15 @@ function readU64LE(raw: Uint8Array, offset: number): number {
   return val
 }
 
-function readU128LE(raw: Uint8Array, offset: number): number {
-  // Only need the lower 64 bits — allocations fit well within safe integer range
-  let val = 0
-  for (let i = 0; i < 8; i++) val += raw[offset + i] * Math.pow(2, 8 * i)
-  return val
+// token_target_allocation_sf is a Kamino scaled-fraction (u128, scale = 2^60).
+// Must use BigInt — the raw value is ~10^32, well beyond Number.MAX_SAFE_INTEGER.
+// After >> 60, the result (~10^14 base units) safely fits in a JS number.
+const SF_SCALE = 1n << 60n
+
+function readU128SF(raw: Uint8Array, offset: number): number {
+  let val = 0n
+  for (let i = 0; i < 16; i++) val += BigInt(raw[offset + i]) << BigInt(8 * i)
+  return Number(val / SF_SCALE)  // base token units, safe as JS number
 }
 
 function decodeVaultAccount(raw: Uint8Array): VaultTokenInfo | null {
@@ -132,14 +136,14 @@ function decodeVaultAccount(raw: Uint8Array): VaultTokenInfo | null {
     const base    = KVAULT_ALLOC_ARRAY_OFFSET + i * KVAULT_ALLOC_ENTRY_SIZE
     if (base + ALLOC_TOKEN_SF_OFFSET + 16 > raw.length) break
 
-    const ctokens = readU64LE(raw, base + ALLOC_CTOKEN_OFFSET)
-    const sfRaw   = readU128LE(raw, base + ALLOC_TOKEN_SF_OFFSET)
+    const ctokens  = readU64LE(raw, base + ALLOC_CTOKEN_OFFSET)
+    const baseUnits = readU128SF(raw, base + ALLOC_TOKEN_SF_OFFSET)
 
-    // Skip empty slots (no ctokens and no target allocation)
-    if (ctokens === 0 && sfRaw === 0) continue
+    // Skip empty slots
+    if (ctokens === 0 && baseUnits === 0) continue
 
     const reserve     = base58Encode(raw.slice(base + ALLOC_RESERVE_OFFSET, base + ALLOC_RESERVE_OFFSET + 32))
-    const tokenAmount = sfRaw / divisor
+    const tokenAmount = baseUnits / divisor
 
     if (!firstReserve) firstReserve = reserve
     allocations.push({ reserve, tokenAmount })
