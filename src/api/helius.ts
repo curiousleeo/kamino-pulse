@@ -101,6 +101,13 @@ export interface VaultTokenInfo {
   allocations: VaultAllocation[]
 }
 
+// Hardcoded fallback for vaults whose on-chain decode may fail (public RPC rate limits,
+// CORS issues). Only the tokenMint is needed — enough to trigger the registry fallback
+// in kamino.ts. Add entries here as new vaults are encountered.
+const KNOWN_VAULT_MINTS: Record<string, string> = {
+  'A2wsxhA7pF4B2UKVfXocb6TAAP9ipfPJam6oMKgDE5BK': '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo', // Sentora PYUSD
+}
+
 // Module-level cache — RPC is only hit once per vault per session
 const vaultTokenInfoCache = new Map<string, VaultTokenInfo>()
 
@@ -165,17 +172,25 @@ export async function fetchVaultTokenInfo(
 
   try {
     const result = await rpc('getAccountInfo', [vaultAddress, { encoding: 'base64' }])
-    if (!result?.value?.data) return null
+    if (!result?.value?.data) return mintFallback(vaultAddress)
 
     const raw  = Uint8Array.from(atob(result.value.data[0]), c => c.charCodeAt(0))
     const info = decodeVaultAccount(raw)
-    if (!info) return null
+    if (!info) return mintFallback(vaultAddress)
 
     vaultTokenInfoCache.set(vaultAddress, info)
     return info
   } catch {
-    return null
+    return mintFallback(vaultAddress)
   }
+}
+
+function mintFallback(vaultAddress: string): VaultTokenInfo | null {
+  const mint = KNOWN_VAULT_MINTS[vaultAddress]
+  if (!mint) return null
+  // Return mint-only info — no allocations, but enough to trigger the
+  // registry-based fallback aggregation in kamino.ts
+  return { tokenMint: mint, reservePubkey: '', decimals: 0, allocations: [] }
 }
 
 // Export for tests / debugging
