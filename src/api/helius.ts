@@ -68,63 +68,105 @@ function base58Encode(bytes: Uint8Array): string {
 }
 
 // ─── K-Vault account struct offsets ──────────────────────────────────────────
-// The Kamino K-Vault program (KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd)
-// stores these fields at fixed offsets in its Anchor account layout:
-//   offset  80 (32 bytes): underlying token mint pubkey
-//   offset 312 (32 bytes): associated Kamino lending reserve pubkey
-const KVAULT_TOKEN_MINT_OFFSET   = 80
-const KVAULT_RESERVE_PUBKEY_OFFSET = 312
+// Verified from Kamino-Finance/kvault programs/kvault/src/state.rs (master branch)
+//
+// VaultState layout (Anchor, 8-byte discriminator prefix):
+//   offset   80 (32 bytes): token_mint pubkey
+//   offset  112 ( 8 bytes): token_mint_decimals (u64)
+//   offset  312          : vault_allocation_strategy — [VaultAllocation; 25]
+//
+// VaultAllocation layout (2160 bytes each):
+//   offset    0 (32 bytes): reserve pubkey
+//   offset 1104 ( 8 bytes): ctoken_allocation (u64)
+//   offset 1120 (16 bytes): token_target_allocation_sf (u128, raw token units × 10^decimals)
+const KVAULT_TOKEN_MINT_OFFSET      = 80
+const KVAULT_TOKEN_DECIMALS_OFFSET  = 112
+const KVAULT_ALLOC_ARRAY_OFFSET     = 312
+const KVAULT_ALLOC_ENTRY_SIZE       = 2160
+const KVAULT_ALLOC_MAX              = 25
+// Within each VaultAllocation entry:
+const ALLOC_RESERVE_OFFSET          = 0
+const ALLOC_CTOKEN_OFFSET           = 1104   // u64
+const ALLOC_TOKEN_SF_OFFSET         = 1120   // u128
 
-// Hardcoded fallback for known vaults — vault-to-reserve relationships are
-// permanent on-chain. Used when the RPC call fails (rate limit on public endpoint).
-// Add entries as new vaults are decoded.
-const KNOWN_VAULT_TOKEN_INFO: Record<string, { tokenMint: string; reservePubkey: string }> = {
-  // Sentora PYUSD Vault → Main Market PYUSD reserve
-  'A2wsxhA7pF4B2UKVfXocb6TAAP9ipfPJam6oMKgDE5BK': {
-    tokenMint:    '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo',
-    reservePubkey: '2gc9Dm1eB6UgVYFBUN9bWks6Kes9PbWSaPaa9DqyvEiN',
-  },
+export interface VaultAllocation {
+  reserve: string       // lending reserve pubkey
+  tokenAmount: number   // vault's allocation in token units (human-readable, e.g. 109_697_201 PYUSD)
 }
 
-// Module-level cache: once we decode a vault's on-chain data, store it
-// so subsequent refreshes don't need to re-hit the RPC endpoint
-const vaultTokenInfoCache = new Map<string, { tokenMint: string; reservePubkey: string }>()
+export interface VaultTokenInfo {
+  tokenMint: string
+  reservePubkey: string  // first active reserve (kept for backward compat)
+  decimals: number
+  allocations: VaultAllocation[]
+}
+
+// Module-level cache — RPC is only hit once per vault per session
+const vaultTokenInfoCache = new Map<string, VaultTokenInfo>()
+
+function readU64LE(raw: Uint8Array, offset: number): number {
+  let val = 0
+  for (let i = 0; i < 8; i++) val += raw[offset + i] * Math.pow(2, 8 * i)
+  return val
+}
+
+function readU128LE(raw: Uint8Array, offset: number): number {
+  // Only need the lower 64 bits — allocations fit well within safe integer range
+  let val = 0
+  for (let i = 0; i < 8; i++) val += raw[offset + i] * Math.pow(2, 8 * i)
+  return val
+}
+
+function decodeVaultAccount(raw: Uint8Array): VaultTokenInfo | null {
+  const minSize = KVAULT_ALLOC_ARRAY_OFFSET + KVAULT_ALLOC_ENTRY_SIZE
+  if (raw.length < minSize) return null
+
+  const tokenMint  = base58Encode(raw.slice(KVAULT_TOKEN_MINT_OFFSET, KVAULT_TOKEN_MINT_OFFSET + 32))
+  const decimals   = readU64LE(raw, KVAULT_TOKEN_DECIMALS_OFFSET)
+  const divisor    = Math.pow(10, decimals)
+
+  const allocations: VaultAllocation[] = []
+  let firstReserve = ''
+
+  for (let i = 0; i < KVAULT_ALLOC_MAX; i++) {
+    const base    = KVAULT_ALLOC_ARRAY_OFFSET + i * KVAULT_ALLOC_ENTRY_SIZE
+    if (base + ALLOC_TOKEN_SF_OFFSET + 16 > raw.length) break
+
+    const ctokens = readU64LE(raw, base + ALLOC_CTOKEN_OFFSET)
+    const sfRaw   = readU128LE(raw, base + ALLOC_TOKEN_SF_OFFSET)
+
+    // Skip empty slots (no ctokens and no target allocation)
+    if (ctokens === 0 && sfRaw === 0) continue
+
+    const reserve     = base58Encode(raw.slice(base + ALLOC_RESERVE_OFFSET, base + ALLOC_RESERVE_OFFSET + 32))
+    const tokenAmount = sfRaw / divisor
+
+    if (!firstReserve) firstReserve = reserve
+    allocations.push({ reserve, tokenAmount })
+  }
+
+  return { tokenMint, reservePubkey: firstReserve, decimals, allocations }
+}
 
 /**
- * Reads the K-Vault program account on-chain and extracts the underlying
- * token mint and lending reserve pubkey from their fixed struct offsets.
- * Results are cached in memory so the RPC is only hit once per vault per session.
- * Returns null if the account cannot be read or is too small.
+ * Reads the K-Vault program account on-chain and returns the token mint,
+ * decimals, and per-reserve allocation amounts.
+ * Cached in memory — RPC is only called once per vault per session.
  */
 export async function fetchVaultTokenInfo(
   vaultAddress: string
-): Promise<{ tokenMint: string; reservePubkey: string } | null> {
-  // 1. In-memory cache (populated on first successful decode)
+): Promise<VaultTokenInfo | null> {
   const cached = vaultTokenInfoCache.get(vaultAddress)
   if (cached) return cached
 
-  // 2. Hardcoded map for known vaults (works even without RPC)
-  const known = KNOWN_VAULT_TOKEN_INFO[vaultAddress]
-  if (known) {
-    vaultTokenInfoCache.set(vaultAddress, known)
-    return known
-  }
-
-  // 3. On-chain decode via RPC (falls back across public endpoints)
   try {
     const result = await rpc('getAccountInfo', [vaultAddress, { encoding: 'base64' }])
     if (!result?.value?.data) return null
 
-    const raw = Uint8Array.from(atob(result.value.data[0]), c => c.charCodeAt(0))
-    if (raw.length < KVAULT_RESERVE_PUBKEY_OFFSET + 32) return null
+    const raw  = Uint8Array.from(atob(result.value.data[0]), c => c.charCodeAt(0))
+    const info = decodeVaultAccount(raw)
+    if (!info) return null
 
-    const tokenMintBytes     = raw.slice(KVAULT_TOKEN_MINT_OFFSET, KVAULT_TOKEN_MINT_OFFSET + 32)
-    const reservePubkeyBytes = raw.slice(KVAULT_RESERVE_PUBKEY_OFFSET, KVAULT_RESERVE_PUBKEY_OFFSET + 32)
-
-    const info = {
-      tokenMint:    base58Encode(tokenMintBytes),
-      reservePubkey: base58Encode(reservePubkeyBytes),
-    }
     vaultTokenInfoCache.set(vaultAddress, info)
     return info
   } catch {

@@ -509,21 +509,27 @@ export async function fetchUserVaultPositions(
       }
       if (!tokenSymbol) tokenSymbol = vaultStats.resolvedTokenSymbol
 
-      // Aggregate borrow/supply across ALL reserves matching this vault's token mint.
-      // Multi-allocation vaults (e.g. Sentora PYUSD) deploy across several markets —
-      // summing by mint gives the blended total that matches Kamino's own UI.
-      let aggSupply = 0
-      let aggBorrow = 0
-      if (registry && resolvedTokenMint) {
-        for (const r of Object.values(registry)) {
-          if (r.mint === resolvedTokenMint) {
-            aggSupply += r.totalSupplyUsd
-            aggBorrow += r.totalBorrowUsd
-          }
+      // Compute vault's borrow exposure using on-chain allocation amounts per reserve.
+      // Each allocation entry has the exact tokens the vault deployed to that reserve.
+      // We multiply by the reserve's utilization rate to get how much of the vault's
+      // capital is currently borrowed — this matches Kamino's own UI calculation.
+      let reserveTotalBorrowUsd = 0
+      const allocations = tokenInfo?.allocations ?? []
+      const tokenPrice  = metrics.tokenPrice > 0 ? metrics.tokenPrice : 1
+
+      if (allocations.length > 0 && registry) {
+        for (const alloc of allocations) {
+          const reserveInfo = registry[alloc.reserve]
+          if (!reserveInfo) continue
+          const allocUsd = alloc.tokenAmount * tokenPrice
+          reserveTotalBorrowUsd += allocUsd * reserveInfo.utilization
         }
+      } else {
+        // Fallback: two-step vault API → registry
+        reserveTotalBorrowUsd = vaultStats.totalBorrowUsd || metrics.totalBorrowUsd || 0
       }
-      const reserveTotalSupplyUsd = aggSupply || vaultStats.totalSupplyUsd || metrics.totalSupplyUsd || 0
-      const reserveTotalBorrowUsd = aggBorrow || vaultStats.totalBorrowUsd || metrics.totalBorrowUsd || 0
+
+      const reserveTotalSupplyUsd = metrics.totalSupplyUsd || vaultStats.totalSupplyUsd || 0
       const reserveUtilization    = reserveTotalSupplyUsd > 0
         ? reserveTotalBorrowUsd / reserveTotalSupplyUsd
         : vaultStats.reserveUtilization || metrics.reserveUtilization || 0
