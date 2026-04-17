@@ -509,11 +509,24 @@ export async function fetchUserVaultPositions(
       }
       if (!tokenSymbol) tokenSymbol = vaultStats.resolvedTokenSymbol
 
-      // Reserve-level stats: vault API (two-step) → metrics API → registry
-      const reserveInfo = registry && resolvedReservePubkey ? registry[resolvedReservePubkey] : undefined
-      const reserveTotalSupplyUsd = vaultStats.totalSupplyUsd || metrics.totalSupplyUsd || reserveInfo?.totalSupplyUsd || 0
-      const reserveTotalBorrowUsd = vaultStats.totalBorrowUsd || metrics.totalBorrowUsd || reserveInfo?.totalBorrowUsd || 0
-      const reserveUtilization    = vaultStats.reserveUtilization || metrics.reserveUtilization || reserveInfo?.utilization || 0
+      // Aggregate borrow/supply across ALL reserves matching this vault's token mint.
+      // Multi-allocation vaults (e.g. Sentora PYUSD) deploy across several markets —
+      // summing by mint gives the blended total that matches Kamino's own UI.
+      let aggSupply = 0
+      let aggBorrow = 0
+      if (registry && resolvedTokenMint) {
+        for (const r of Object.values(registry)) {
+          if (r.mint === resolvedTokenMint) {
+            aggSupply += r.totalSupplyUsd
+            aggBorrow += r.totalBorrowUsd
+          }
+        }
+      }
+      const reserveTotalSupplyUsd = aggSupply || vaultStats.totalSupplyUsd || metrics.totalSupplyUsd || 0
+      const reserveTotalBorrowUsd = aggBorrow || vaultStats.totalBorrowUsd || metrics.totalBorrowUsd || 0
+      const reserveUtilization    = reserveTotalSupplyUsd > 0
+        ? reserveTotalBorrowUsd / reserveTotalSupplyUsd
+        : vaultStats.reserveUtilization || metrics.reserveUtilization || 0
 
       return {
         ...pos,
