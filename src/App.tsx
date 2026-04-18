@@ -430,29 +430,17 @@ export default function App() {
     setWallet(w)
   }
 
-  // ── No wallet → Landing ──
-  if (!wallet) {
-    return (
-      <LandingHero
-        onSearch={handleSearch}
-        loading={loading}
-        tvl={kaminoTVL || undefined}
-      />
-    )
-  }
-
-  // ── Derived data ──
+  // ── Derived data (computed unconditionally so hooks below are always called) ──
   const activeObligations = getActiveObligations(obligations)
   const activeVaults      = vaultPositions.filter(v => Number(v.totalShares ?? 0) > 0)
   const totals            = portfolioTotals(activeObligations, activeVaults)
   const hasPositions      = activeObligations.length > 0 || activeVaults.length > 0
 
-  const cfg      = OVERALL_CONFIG[overall]
+  const cfg        = OVERALL_CONFIG[overall]
   const overallScore = tierToScore(overall)
-  const tone     = overall === 'green' ? 'good' : overall === 'yellow' ? 'watch' : 'risk'
-  const stageIdx = overall === 'green' ? 0 : overall === 'yellow' ? 1 : overall === 'orange' ? 2 : 3
+  const tone       = overall === 'green' ? 'good' : overall === 'yellow' ? 'watch' : 'risk'
+  const stageIdx   = overall === 'green' ? 0 : overall === 'yellow' ? 1 : overall === 'orange' ? 2 : 3
 
-  // Radar items
   const radarItems: RadarItem[] = layers.map(l => ({
     key:    l.id,
     name:   l.name,
@@ -460,11 +448,9 @@ export default function App() {
     score:  tierToScore(l.tier),
   }))
 
-  // Active risk layer for drill
-  const activeLayer = layers.find(l => l.id === riskActive) ?? layers[0]
+  const activeLayer  = layers.find(l => l.id === riskActive) ?? layers[0]
   const flaggedCount = radarItems.filter(r => r.status !== 'good').length
 
-  // Earnings from vaults
   const primaryVault   = activeVaults[0]
   const apyBase        = primaryVault?.apy ?? 0
   const apyFarm        = primaryVault?.apyFarmRewards ?? 0
@@ -475,18 +461,16 @@ export default function App() {
   const earnPerDay     = earnPerYear / 365
   const earnTarget     = earnMode === 'day' ? earnPerDay : earnMode === 'month' ? earnPerMonth : earnPerYear
 
-  // Withdrawal data from primary vault
-  const vaultTvl      = primaryVault?.vaultTvlUsd ?? 0
-  const totalBorrowUsd= primaryVault?.reserveTotalBorrowUsd ?? 0
-  const utilization   = primaryVault?.reserveUtilization ?? 0
-  const yourPosition  = primaryVault?.totalValueUsd ?? 0
-  const availableUsd  = totalBorrowUsd > 0
+  const vaultTvl       = primaryVault?.vaultTvlUsd ?? 0
+  const totalBorrowUsd = primaryVault?.reserveTotalBorrowUsd ?? 0
+  const utilization    = primaryVault?.reserveUtilization ?? 0
+  const yourPosition   = primaryVault?.totalValueUsd ?? 0
+  const availableUsd   = totalBorrowUsd > 0
     ? Math.max(vaultTvl - totalBorrowUsd, 0)
     : (primaryVault?.tokensAvailableUsd ?? 0)
-  const coverage      = yourPosition > 0 ? availableUsd / yourPosition : 0
-  const pctOfAvailable= coverage > 0 ? 100 / coverage : 0
+  const coverage       = yourPosition > 0 ? availableUsd / yourPosition : 0
+  const pctOfAvailable = coverage > 0 ? 100 / coverage : 0
 
-  // Ticker items
   const tickerItems: [string, string, string, 'up' | 'dn'][] = [
     ...(kaminoTVL > 0 ? [['KAMINO TVL', fmtMoney(kaminoTVL, true), '', 'up'] as [string, string, string, 'up' | 'dn']] : []),
     ...(utilization > 0 ? [['VAULT UTIL', `${(utilization * 100).toFixed(2)}%`, '', 'dn'] as [string, string, string, 'up' | 'dn']] : []),
@@ -498,11 +482,22 @@ export default function App() {
     ] as [string, string, string, 'up' | 'dn']),
   ]
 
-  // Count-up animated values (called at top level, not conditionally)
+  // useCountUp must be called unconditionally — before any early return
   const animNetWorth  = useCountUp(totals.net)
   const animDeposited = useCountUp(totals.deposited)
   const animCoverage  = useCountUp(coverage)
   const animEarn      = useCountUp(earnTarget)
+
+  // ── No wallet → Landing ──
+  if (!wallet) {
+    return (
+      <LandingHero
+        onSearch={handleSearch}
+        loading={loading}
+        tvl={kaminoTVL || undefined}
+      />
+    )
+  }
 
   const stripStages = [
     { label: 'ALL GOOD', tone: 'good' },
