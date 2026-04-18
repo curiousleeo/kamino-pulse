@@ -167,7 +167,7 @@ html[data-density="compact"] {
 }
 @keyframes t-tickslide {
   from { transform: translateX(0); }
-  to   { transform: translateX(-50%); }
+  to   { transform: translateX(-25%); }
 }
 .t-tick { display: inline-flex; gap: 6px; align-items: baseline; }
 .t-tick .t-sym { color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; font-size: 10.5px; }

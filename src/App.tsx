@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import type { RiskLayer, RiskTier } from './types'
 import type { KaminoObligation, KaminoVaultPosition, ReserveRegistry } from './api/kamino'
 import { LandingHero } from './components/LandingHero'
@@ -166,13 +166,17 @@ const OVERALL_CONFIG: Record<RiskTier, { label: string; desc: string }> = {
 }
 
 // ─── Ticker ───────────────────────────────────────────────────────────────────
+// Items are quadrupled and animate -25% for a seamless loop.
+// React.memo prevents animation restarts on parent re-renders.
 
-function TickerBar({ items }: { items: [string, string, string, 'up' | 'dn'][] }) {
-  const doubled = [...items, ...items]
+type TickerItem = [string, string, string, 'up' | 'dn']
+
+const TickerBar = React.memo(function TickerBar({ items }: { items: TickerItem[] }) {
+  const quad = [...items, ...items, ...items, ...items]
   return (
     <div className="t-ticker">
       <div className="t-ticker-track">
-        {doubled.map((t, i) => (
+        {quad.map((t, i) => (
           <span key={i} className="t-tick">
             <span className="t-sym">{t[0]}</span>
             <span className="t-price">{t[1]}</span>
@@ -182,7 +186,7 @@ function TickerBar({ items }: { items: [string, string, string, 'up' | 'dn'][] }
       </div>
     </div>
   )
-}
+})
 
 // ─── Oracle Panel ─────────────────────────────────────────────────────────────
 
@@ -259,6 +263,8 @@ export default function App() {
   const [sparkRange,    setSparkRange]    = useState<'7D' | '30D' | '90D'>('30D')
   const [riskActive,    setRiskActive]    = useState('protocol')
   const [earnMode,      setEarnMode]      = useState<'day' | 'month' | 'year'>('year')
+  const [stableTicker,  setStableTicker]  = useState<TickerItem[]>([])
+  const [walletInput,   setWalletInput]   = useState('')
 
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (localStorage.getItem('kp-theme') as 'dark' | 'light') || 'dark'
@@ -266,6 +272,10 @@ export default function App() {
   const [density, setDensity] = useState<'compact' | 'cozy'>(
     () => (localStorage.getItem('kp-density') as 'compact' | 'cozy') || 'cozy'
   )
+
+  useEffect(() => {
+    if (wallet && walletInput !== wallet) setWalletInput(wallet)
+  }, [wallet])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -428,6 +438,8 @@ export default function App() {
     setLayers([])
     setOverall('loading')
     setWallet(w)
+    setWalletInput(w)
+    setStableTicker([])
   }
 
   // ── Derived data (computed unconditionally so hooks below are always called) ──
@@ -471,16 +483,24 @@ export default function App() {
   const coverage       = yourPosition > 0 ? availableUsd / yourPosition : 0
   const pctOfAvailable = coverage > 0 ? 100 / coverage : 0
 
-  const tickerItems: [string, string, string, 'up' | 'dn'][] = [
-    ...(kaminoTVL > 0 ? [['KAMINO TVL', fmtMoney(kaminoTVL, true), '', 'up'] as [string, string, string, 'up' | 'dn']] : []),
-    ...(utilization > 0 ? [['VAULT UTIL', `${(utilization * 100).toFixed(2)}%`, '', 'dn'] as [string, string, string, 'up' | 'dn']] : []),
+  const tickerItems: TickerItem[] = [
+    ...(kaminoTVL > 0 ? [['KAMINO TVL', fmtMoney(kaminoTVL, true), '', 'up'] as TickerItem] : []),
+    ...(utilization > 0 ? [['VAULT UTIL', `${(utilization * 100).toFixed(2)}%`, '', 'dn'] as TickerItem] : []),
     ...oracleFeeds.slice(0, 8).map(f => [
       f.sym.split('/')[0],
       f.price < 10 ? `$${f.price.toFixed(4)}` : `$${fmtN(f.price, 2)}`,
       '',
       'up',
-    ] as [string, string, string, 'up' | 'dn']),
+    ] as TickerItem),
   ]
+
+  // Freeze ticker after first non-empty load so animation never restarts
+  useEffect(() => {
+    if (stableTicker.length === 0 && tickerItems.length >= 4) {
+      setStableTicker(tickerItems)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tickerItems.length, stableTicker.length])
 
   // useCountUp must be called unconditionally — before any early return
   const animNetWorth  = useCountUp(totals.net)
@@ -528,17 +548,36 @@ export default function App() {
         <div className="t-wallet-row">
           <div className="t-wallet-pill">
             <span className="t-capxs" style={{ color: 'var(--text-4)', flexShrink: 0 }}>WALLET</span>
-            <span style={{ fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {walletMasked ? '•••• •••• ••••' : shortWallet(wallet)}
-            </span>
+            {walletMasked ? (
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text-3)', flex: 1, letterSpacing: '0.08em' }}>
+                •••• •••• ••••
+              </span>
+            ) : (
+              <input
+                value={walletInput}
+                onChange={e => setWalletInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && walletInput.trim().length > 20) {
+                    handleSearch(walletInput.trim())
+                  }
+                }}
+                placeholder="Paste a Solana address…"
+                style={{
+                  background: 'transparent', border: 0, outline: 0,
+                  fontFamily: 'var(--mono)', fontSize: 12.5,
+                  color: 'var(--text)', flex: 1, minWidth: 0, padding: '2px 0',
+                }}
+              />
+            )}
             <button
               className="t-btn-ghost"
               onClick={() => setWalletMasked(m => !m)}
               title={walletMasked ? 'Show wallet' : 'Hide wallet'}
+              style={{ fontSize: 12 }}
             >
               {walletMasked ? '👁' : '🙈'}
             </button>
-            <button className="t-btn-ghost" onClick={() => handleSearch('')}>✕ clear</button>
+            <button className="t-btn-ghost" onClick={() => handleSearch('')}>✕ CLEAR</button>
           </div>
         </div>
 
@@ -563,7 +602,7 @@ export default function App() {
       </header>
 
       {/* ── Ticker ── */}
-      {tickerItems.length > 0 && <TickerBar items={tickerItems} />}
+      {stableTicker.length > 0 && <TickerBar items={stableTicker} />}
 
       {/* ── Main ── */}
       <main className="t-main">
@@ -722,55 +761,51 @@ export default function App() {
             <div className="t-panel">
               <div className="t-panel-head">
                 <div className="t-panel-title">
-                  <span className="t-cap">WITHDRAWAL RISK</span>
-                  <span className="t-capxs" style={{ color: 'var(--text-4)' }}>TRUE VAULT LIQUIDITY</span>
+                  <span className="t-cap">CAN I EXIT NOW?</span>
+                  <span className="t-capxs" style={{ color: 'var(--text-4)' }}>REAL-TIME VAULT LIQUIDITY</span>
                 </div>
                 <span className={`t-chip ${coverage >= 10 ? 'good' : coverage >= 3 ? 'watch' : 'risk'}`}>
-                  {coverage >= 10 ? 'EXIT INSTANT' : coverage >= 3 ? 'LOW RISK' : 'MONITOR'}
+                  {coverage >= 10 ? 'YES — INSTANTLY' : coverage >= 3 ? 'YES — LOW RISK' : coverage >= 1 ? 'SLOW — MONITOR' : 'NO — ILLIQUID'}
                 </span>
               </div>
               <div className="t-wd-body">
                 {yourPosition > 0 ? (
                   <>
+                    {/* Lead with the available number — the answer to "can I exit?" */}
                     <div>
-                      <div className="t-cap" style={{ marginBottom: 4 }}>COVERAGE OF YOUR POSITION</div>
-                      <div className="t-wd-coverage">
-                        {Math.round(animCoverage)}<span className="x">×</span>
+                      <div className="t-cap" style={{ marginBottom: 6 }}>AVAILABLE TO WITHDRAW RIGHT NOW</div>
+                      <div className="t-wd-coverage" style={{ fontSize: 40 }}>
+                        {fmtMoney(availableUsd, true)}
                       </div>
-                      <div className="t-wd-verdict">
+                      <div className="t-wd-verdict" style={{ marginTop: 4 }}>
                         {coverage >= 10
-                          ? 'EXIT INSTANTLY — DEEP LIQUIDITY'
+                          ? `Your $${fmtN(yourPosition, 0)} is ${pctOfAvailable.toFixed(2)}% of the pool — no exit impact`
                           : coverage >= 3
-                            ? 'LOW RISK — AMPLE LIQUIDITY'
-                            : coverage >= 1
-                              ? 'MONITOR — LIQUIDITY TIGHTENING'
-                              : 'CAUTION — LIQUIDITY BELOW POSITION'}
+                            ? `Your $${fmtN(yourPosition, 0)} is ${pctOfAvailable.toFixed(2)}% of available — low impact`
+                            : `Your $${fmtN(yourPosition, 0)} is ${pctOfAvailable.toFixed(1)}% of available — watch closely`}
                       </div>
                     </div>
 
+                    {/* Bar: your position as a tiny slice of available */}
                     <div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 18 }}>
-                        <span>YOUR POSITION</span>
-                        <span>AVAILABLE LIQUIDITY · {fmtMoney(availableUsd, true)}</span>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 8 }}>
+                        <span style={{ color: 'var(--green)' }}>◀ AVAILABLE {fmtMoney(availableUsd, true)}</span>
+                        <span>YOU ${fmtN(yourPosition, 0)} ▶</span>
                       </div>
                       <div className="t-wd-bar-track">
-                        <div className="t-wd-bar-fill" />
+                        <div className="t-wd-bar-fill" style={{ right: `${Math.max(0.5, Math.min(99, pctOfAvailable)).toFixed(1)}%`, left: 0 }} />
                         <div
                           className="t-wd-bar-mark"
-                          style={{ left: `${Math.max(0.3, Math.min(99, pctOfAvailable)).toFixed(1)}%` }}
+                          style={{ left: `${(100 - Math.max(0.5, Math.min(12, pctOfAvailable))).toFixed(1)}%` }}
                         />
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>
-                        <span style={{ color: 'var(--text)' }}>${fmtN(yourPosition, 0)}</span>
-                        <span>= {pctOfAvailable.toFixed(2)}% OF AVAILABLE</span>
                       </div>
                     </div>
 
                     <div className="t-wd-kv">
                       <div><span className="k">VAULT TVL</span><span className="v">{fmtMoney(vaultTvl, true)}</span></div>
-                      <div><span className="k">UTILIZATION</span><span className="v">{(utilization * 100).toFixed(2)}%</span></div>
-                      <div><span className="k">TRUE AVAIL.</span><span className="v">{fmtMoney(availableUsd, true)}</span></div>
-                      <div><span className="k">SOURCE</span><span className="v" style={{ color: 'var(--text-3)' }}>ON-CHAIN</span></div>
+                      <div><span className="k">UTILIZATION</span><span className="v">{(utilization * 100).toFixed(1)}%</span></div>
+                      <div><span className="k">YOUR POSITION</span><span className="v">${fmtN(yourPosition, 0)}</span></div>
+                      <div><span className="k">YOUR SHARE</span><span className="v">{pctOfAvailable.toFixed(2)}% of pool</span></div>
                     </div>
                   </>
                 ) : (
