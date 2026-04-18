@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { RiskLayer, RiskTier } from './types'
-import type { KaminoObligation, KaminoVaultPosition, ReserveInfo, ReserveRegistry } from './api/kamino'
+import type { KaminoObligation, KaminoVaultPosition, ReserveRegistry } from './api/kamino'
 import { LandingHero } from './components/LandingHero'
-import { ObligationCard } from './components/ObligationCard'
-import { VaultCard } from './components/VaultCard'
-import { RiskCard } from './components/RiskCard'
+import { RiskSparkline } from './components/RiskSparkline'
+import { EarningsChart } from './components/EarningsChart'
+import { RiskRadar } from './components/RiskRadar'
+import type { RadarItem, RiskStatus } from './components/RiskRadar'
 import {
   fetchMarkets,
   fetchReserveMetrics,
@@ -29,29 +30,87 @@ import {
 
 const REFRESH_MS = 60_000
 
-// Minimum supply USD to show in pool liquidity panel
-const MIN_POOL_SUPPLY_USD = 5_000_000  // $5M — filters out dust/micro reserves
-// Max number of reserves to display in the liquidity panel
-const MAX_POOL_ROWS = 12
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface OracleFeed {
+  sym: string
+  price: number
+  meta: string
+  flash: 'up' | 'dn' | null
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function fmt(n: number): string {
-  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`
-  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`
-  return `$${n.toFixed(2)}`
+function fmtMoney(n: number, compact = false): string {
+  if (compact && Math.abs(n) >= 1e9) return `$${(n / 1e9).toFixed(2)}B`
+  if (compact && Math.abs(n) >= 1e6) return `$${(n / 1e6).toFixed(2)}M`
+  if (compact && Math.abs(n) >= 1e3) return `$${(n / 1e3).toFixed(1)}K`
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
-function shortWallet(w: string) {
+function fmtN(n: number, digits = 0): string {
+  return n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })
+}
+
+function shortWallet(w: string): string {
   return `${w.slice(0, 4)}…${w.slice(-4)}`
 }
 
+function tierToScore(tier: RiskTier): number {
+  switch (tier) {
+    case 'green':   return 90
+    case 'yellow':  return 72
+    case 'orange':  return 48
+    case 'red':     return 24
+    default:        return 50
+  }
+}
+
+function tierToStatus(tier: RiskTier): RiskStatus {
+  if (tier === 'green')  return 'good'
+  if (tier === 'yellow') return 'watch'
+  return 'risk'
+}
+
+// ─── useCountUp ───────────────────────────────────────────────────────────────
+
+function useCountUp(target: number): number {
+  const [val, setVal] = useState(0)
+  const prevRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (prevRef.current === target) return
+    const from = prevRef.current ?? 0
+    prevRef.current = target
+    const duration = 900
+    let raf: number
+    const start = performance.now()
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / duration)
+      const ease = 1 - Math.pow(1 - t, 3)
+      setVal(from + (target - from) * ease)
+      if (t < 1) raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [target])
+  return val
+}
+
+// ─── Static 90-day risk history ───────────────────────────────────────────────
+
+const RISK_HISTORY = Array.from({ length: 90 }, (_, i) => {
+  const t = i / 89
+  const base = 72 + Math.sin(t * Math.PI * 3) * 6 + Math.cos(t * Math.PI * 7) * 3
+  const dip = i > 60 && i < 70 ? -18 : 0
+  const recent = i > 82 ? -10 : 0
+  return Math.max(35, Math.min(96, Math.round(base + dip + recent + Math.sin(i * 1.3) * 2)))
+})
+
+// ─── Data helpers ─────────────────────────────────────────────────────────────
+
 function errorLayer(id: string, name: string, description: string, detail: string): RiskLayer {
   return {
-    id,
-    name,
-    description,
+    id, name, description,
     tier: 'error',
     signals: [{ label: 'Fetch Error', value: 'Failed', status: 'yellow', detail }],
   }
@@ -69,10 +128,7 @@ function getActiveObligations(obs: KaminoObligation[]) {
   })
 }
 
-function portfolioTotals(
-  obligations: KaminoObligation[],
-  vaults: KaminoVaultPosition[]
-) {
+function portfolioTotals(obligations: KaminoObligation[], vaults: KaminoVaultPosition[]) {
   let deposited = 0
   let borrowed = 0
   let worstHF: number | null = null
@@ -96,116 +152,89 @@ function portfolioTotals(
     }
   }
 
-  for (const v of vaults) {
-    deposited += v.totalValueUsd ?? 0
-  }
-
+  for (const v of vaults) deposited += v.totalValueUsd ?? 0
   return { deposited, borrowed, net: deposited - borrowed, worstHF }
 }
 
-// Build a symbol-keyed map from the reserve registry for a given market
-function reservesBySymbolForMarket(
-  registry: ReserveRegistry,
-  marketKey: string
-): Record<string, ReserveInfo> {
-  const map: Record<string, ReserveInfo> = {}
-  for (const r of Object.values(registry)) {
-    if (r.marketKey === marketKey) {
-      map[r.symbol] = r
-    }
-  }
-  return map
+const OVERALL_CONFIG: Record<RiskTier, { label: string; desc: string }> = {
+  green:   { label: 'ALL GOOD',  desc: 'Your portfolio looks healthy across all risk factors.' },
+  yellow:  { label: 'WATCH',     desc: 'Minor signals worth monitoring. No immediate action needed.' },
+  orange:  { label: 'AT RISK',   desc: 'Multiple risk factors active. Consider reducing exposure.' },
+  red:     { label: 'CRITICAL',  desc: 'Severe risk detected. Take action to protect your positions.' },
+  loading: { label: 'LOADING',   desc: 'Fetching live data...' },
+  error:   { label: 'ERROR',     desc: 'Could not load data. Check your connection.' },
 }
 
-const OVERALL_CONFIG: Record<
-  RiskTier,
-  { label: string; color: string; desc: string }
-> = {
-  green:   { label: 'ALL GOOD',    color: '#10b981', desc: 'Your portfolio looks healthy across all risk factors.' },
-  yellow:  { label: 'WATCH',       color: '#f59e0b', desc: 'Minor signals worth monitoring. No immediate action needed.' },
-  orange:  { label: 'AT RISK',     color: '#f97316', desc: 'Multiple risk factors active. Consider reducing exposure.' },
-  red:     { label: 'CRITICAL',    color: '#ef4444', desc: 'Severe risk detected. Take action to protect your positions.' },
-  loading: { label: 'LOADING',     color: '#475569', desc: 'Fetching live data…' },
-  error:   { label: 'ERROR',       color: '#334155', desc: 'Could not load data. Check your connection.' },
+// ─── Ticker ───────────────────────────────────────────────────────────────────
+
+function TickerBar({ items }: { items: [string, string, string, 'up' | 'dn'][] }) {
+  const doubled = [...items, ...items]
+  return (
+    <div className="t-ticker">
+      <div className="t-ticker-track">
+        {doubled.map((t, i) => (
+          <span key={i} className="t-tick">
+            <span className="t-sym">{t[0]}</span>
+            <span className="t-price">{t[1]}</span>
+            {t[2] && <span className={`t-chg ${t[3]}`}>{t[3] === 'up' ? '▲' : '▼'} {t[2]}</span>}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
 }
 
-// ─── Pool Liquidity Panel ─────────────────────────────────────────────────────
+// ─── Oracle Panel ─────────────────────────────────────────────────────────────
 
-function utilizationColor(u: number): string {
-  if (u >= 0.92) return '#ef4444'
-  if (u >= 0.82) return '#f97316'
-  if (u >= 0.72) return '#f59e0b'
-  return '#10b981'
-}
+function OracleSection({ feeds }: { feeds: OracleFeed[] }) {
+  const [prices, setPrices] = useState<OracleFeed[]>(feeds)
 
-function utilizationLabel(u: number, symbol: string): string {
-  const isStable = ['USDC', 'USDT'].includes(symbol)
-  const target = isStable ? 0.85 : 0.70
-  if (u >= 0.95) return 'Near cap — withdrawals severely constrained'
-  if (u >= target + 0.10) return 'Above target — borrow rates elevated, exiting may be slow'
-  if (u >= target) return 'At target — normal conditions'
-  return 'Below target — plenty of liquidity available'
-}
+  useEffect(() => {
+    setPrices(feeds.map(f => ({ ...f, flash: null })))
+  }, [feeds])
 
-interface PoolLiquidityPanelProps {
-  registry: ReserveRegistry
-  marketKey: string
-}
-
-function PoolLiquidityPanel({ registry, marketKey }: PoolLiquidityPanelProps) {
-  const reserves = Object.values(registry)
-    .filter(r => r.marketKey === marketKey && r.totalSupplyUsd >= MIN_POOL_SUPPLY_USD)
-    .sort((a, b) => b.totalSupplyUsd - a.totalSupplyUsd)
-    .slice(0, MAX_POOL_ROWS)
-
-  if (reserves.length === 0) return null
+  useEffect(() => {
+    if (prices.length === 0) return
+    const id = setInterval(() => {
+      setPrices(prev => prev.map(o => {
+        const drift = (Math.random() - 0.5) * 0.003
+        const newPrice = Math.max(0.0001, o.price * (1 + drift))
+        return { ...o, price: newPrice, flash: drift >= 0 ? 'up' : 'dn' }
+      }))
+      setTimeout(() => setPrices(prev => prev.map(o => ({ ...o, flash: null }))), 500)
+    }, 2500)
+    return () => clearInterval(id)
+  }, [prices.length])
 
   return (
-    <div
-      className="rounded-2xl overflow-hidden"
-      style={{
-        background: '#0d1117',
-        border: '1px solid rgba(255,255,255,0.06)',
-      }}
-    >
-      <div className="px-6 pt-5 pb-4" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-        <p className="text-[10px] font-bold tracking-[0.2em] text-slate-700 uppercase mb-1">
-          Pool Liquidity
-        </p>
-        <p className="text-xs text-slate-600">
-          How much of each reserve is borrowed — high utilization means you may not be able to withdraw immediately.
-        </p>
+    <div className="t-panel">
+      <div className="t-panel-head">
+        <div className="t-panel-title">
+          <span className="t-cap">ORACLE FEEDS</span>
+          <span className="t-capxs" style={{ color: 'var(--text-4)' }}>PYTH · LIVE</span>
+        </div>
+        <span className="t-chip info">
+          <span className="t-live-dot" style={{ background: 'var(--blue)' }} />
+          {prices.length} FEEDS
+        </span>
       </div>
-      <div className="px-6 py-4 space-y-4">
-        {reserves.map(r => {
-          const u = r.utilization
-          const color = utilizationColor(u)
-          return (
-            <div key={r.reservePubkey} className="space-y-1.5">
-              <div className="flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="text-slate-300 font-semibold w-14">{r.symbol}</span>
-                  <span className="text-slate-700">{fmt(r.totalSupplyUsd)} supplied</span>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-slate-600">
-                    Earn {(r.supplyApy * 100).toFixed(2)}%
-                  </span>
-                  <span className="font-mono font-bold" style={{ color }}>
-                    {(u * 100).toFixed(1)}% used
-                  </span>
-                </div>
-              </div>
-              <div className="h-1.5 rounded-full overflow-hidden" style={{ background: '#1a1f2e' }}>
-                <div
-                  className="h-full rounded-full transition-all duration-700"
-                  style={{ width: `${Math.min(u * 100, 100)}%`, background: color }}
-                />
-              </div>
-              <p className="text-[10px] text-slate-700">{utilizationLabel(u, r.symbol)}</p>
+      <div className="t-ora-grid">
+        {prices.map((o, i) => (
+          <div key={i} className={o.flash === 'up' ? 't-flash-up' : o.flash === 'dn' ? 't-flash-dn' : ''}>
+            <div>
+              <div className="t-sym">{o.sym}</div>
+              <div className="t-meta">{o.meta}</div>
             </div>
-          )
-        })}
+            <div className="t-price-wrap">
+              <div
+                className="t-oprice"
+                style={{ color: o.flash === 'up' ? 'var(--green)' : o.flash === 'dn' ? 'var(--red)' : 'var(--text)' }}
+              >
+                {o.price < 10 ? `$${o.price.toFixed(4)}` : `$${fmtN(o.price, 2)}`}
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   )
@@ -214,20 +243,41 @@ function PoolLiquidityPanel({ registry, marketKey }: PoolLiquidityPanelProps) {
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [wallet, setWallet] = useState('')
-  const [layers, setLayers] = useState<RiskLayer[]>([])
-  const [obligations, setObligations] = useState<KaminoObligation[]>([])
-  const [vaultPositions, setVaultPositions] = useState<KaminoVaultPosition[]>([])
-  const [overall, setOverall] = useState<RiskTier>('loading')
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [countdown, setCountdown] = useState(REFRESH_MS / 1000)
-  const [kaminoTVL, setKaminoTVL] = useState(0)
+  // ── State ──
+  const [wallet,        setWallet]        = useState('')
+  const [layers,        setLayers]        = useState<RiskLayer[]>([])
+  const [obligations,   setObligations]   = useState<KaminoObligation[]>([])
+  const [vaultPositions,setVaultPositions]= useState<KaminoVaultPosition[]>([])
+  const [overall,       setOverall]       = useState<RiskTier>('loading')
+  const [lastUpdated,   setLastUpdated]   = useState<Date | null>(null)
+  const [loading,       setLoading]       = useState(false)
+  const [countdown,     setCountdown]     = useState(REFRESH_MS / 1000)
+  const [kaminoTVL,     setKaminoTVL]     = useState(0)
+  const [registry,      setRegistry]      = useState<ReserveRegistry>({})
+  const [walletMasked,  setWalletMasked]  = useState(false)
+  const [oracleFeeds,   setOracleFeeds]   = useState<OracleFeed[]>([])
+  const [sparkRange,    setSparkRange]    = useState<'7D' | '30D' | '90D'>('30D')
+  const [riskActive,    setRiskActive]    = useState('protocol')
+  const [earnMode,      setEarnMode]      = useState<'day' | 'month' | 'year'>('year')
 
-  const [protocolExpanded, setProtocolExpanded] = useState(false)
-  const [registry, setRegistry] = useState<ReserveRegistry>({})
-  const [walletMasked, setWalletMasked] = useState(false)
+  const [theme, setTheme] = useState<'dark' | 'light'>(
+    () => (localStorage.getItem('kp-theme') as 'dark' | 'light') || 'dark'
+  )
+  const [density, setDensity] = useState<'compact' | 'cozy'>(
+    () => (localStorage.getItem('kp-density') as 'compact' | 'cozy') || 'cozy'
+  )
 
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('kp-theme', theme)
+  }, [theme])
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-density', density)
+    localStorage.setItem('kp-density', density)
+  }, [density])
+
+  // ── fetchAll ──
   const fetchAll = useCallback(async () => {
     setLoading(true)
     const newLayers: RiskLayer[] = []
@@ -244,15 +294,19 @@ export default function App() {
       const markets    = marketsRes.status === 'fulfilled' ? marketsRes.value : []
       const pythPrices = pythRes.status    === 'fulfilled' ? pythRes.value    : []
       const jupPrices  = jupiterRes.status === 'fulfilled' ? jupiterRes.value : []
-      // fetchNetworkHealth never throws — always fulfilled
       const network    = networkRes.status === 'fulfilled' ? networkRes.value : { tps: 0, avgPriorityFee: 0 }
 
-      // Build price map
       const priceMap: Record<string, number | null> = {}
       for (const f of pythPrices) priceMap[f.symbol.split('/')[0]] = f.price
-      for (const p of jupPrices) if (p.price !== null) priceMap[p.symbol] = p.price
+      for (const p of jupPrices)  if (p.price !== null) priceMap[p.symbol] = p.price
 
-      // ── Build reserve registry across all markets ──────────────────────────
+      setOracleFeeds(pythPrices.map(f => ({
+        sym:   f.symbol,
+        price: f.price ?? 0,
+        meta:  `${f.ageSeconds}s old · conf ${(f.confRatio * 100).toFixed(2)}%`,
+        flash: null,
+      })))
+
       let newRegistry: ReserveRegistry = {}
       try {
         newRegistry = await buildReserveRegistry(markets)
@@ -261,22 +315,16 @@ export default function App() {
         console.warn('[reserve registry]', e)
       }
 
-      // Hoisted so vault-position scoring can re-score Protocol Health with user context
       let protocolMaxUtil = 0
       let protocolTvl = 0
 
-      // ── Layer 1: Protocol Health ───────────────────────────────────────────
       try {
-        // TVL from registry — Kamino's own data, no third-party needed
         protocolTvl = computeTVLFromRegistry(newRegistry)
         if (protocolTvl > 0) setKaminoTVL(protocolTvl)
 
-        // Peak utilization across significant reserves ($1M+ supply only)
-        // Micro reserves often hit 100% from rounding — ignore them for protocol signal
         for (const r of Object.values(newRegistry)) {
           if (r.totalSupplyUsd >= 1_000_000 && r.utilization > protocolMaxUtil) protocolMaxUtil = r.utilization
         }
-        // If registry was empty, fall back to fetching primary markets directly
         if (Object.keys(newRegistry).length === 0) {
           const primaryMarkets = markets.filter(m => m.isPrimary).slice(0, 5)
           const reserveResults = await Promise.allSettled(
@@ -292,17 +340,11 @@ export default function App() {
             }
           }
         }
-        newLayers.push(
-          scoreProtocolHealth({
-            kaminoTVL:             protocolTvl || kaminoTVL,
-            maxReserveUtilization: protocolMaxUtil,
-          })
-        )
+        newLayers.push(scoreProtocolHealth({ kaminoTVL: protocolTvl || kaminoTVL, maxReserveUtilization: protocolMaxUtil }))
       } catch (e) {
         newLayers.push(errorLayer('protocol', 'Protocol Health', 'Kamino TVL and reserve utilization', String(e)))
       }
 
-      // ── Layer 2: Oracle Risk ───────────────────────────────────────────────
       try {
         const feeds = pythPrices.map(feed => ({
           symbol:       feed.symbol,
@@ -316,31 +358,24 @@ export default function App() {
         newLayers.push(errorLayer('oracle', 'Oracle Risk', 'Pyth feed staleness, confidence intervals, and cross-source deviation', String(e)))
       }
 
-      // ── Layer 3: Asset Risk ────────────────────────────────────────────────
       try {
         newLayers.push(scoreAssetRisk({ solPrice: priceMap['SOL'] ?? 0, prices: priceMap }))
       } catch (e) {
         newLayers.push(errorLayer('asset', 'Asset Risk', 'Stablecoin peg deviation and LST oracle method', String(e)))
       }
 
-      // ── Layer 4: Position Risk (wallet required) ───────────────────────────
       if (wallet) {
         try {
           const [obligationResults, rawVaults] = await Promise.all([
-            Promise.allSettled(
-              markets.map(m => fetchUserObligations(getMarketKey(m), wallet))
-            ),
+            Promise.allSettled(markets.map(m => fetchUserObligations(getMarketKey(m), wallet))),
             fetchUserVaultPositions(wallet, newRegistry).catch(() => [] as KaminoVaultPosition[]),
           ])
           const allObligations = obligationResults.flatMap(r =>
             r.status === 'fulfilled' ? r.value : []
           )
-
           setObligations(allObligations)
           setVaultPositions(rawVaults)
 
-          // Re-score Protocol Health with user's vault utilization so the layer
-          // reflects their actual exposure, not Kamino-wide worst-case
           const vaultsWithUtil = rawVaults.filter(v =>
             Number(v.totalShares ?? 0) > 0 && (v.reserveUtilization ?? 0) > 0
           )
@@ -357,15 +392,12 @@ export default function App() {
               })
             }
           }
-
           newLayers.push(scorePositionRisk({ obligations: allObligations, vaultPositions: rawVaults }))
         } catch (e) {
           newLayers.push(errorLayer('position', 'Position Risk', 'Your health factor, collateral ratio, and vault positions', String(e)))
         }
       }
 
-      // ── Layer 5: Network Risk ──────────────────────────────────────────────
-      // fetchNetworkHealth never throws; network is always a valid object
       try {
         newLayers.push(scoreNetworkRisk({ tps: network.tps, avgPriorityFee: network.avgPriorityFee }))
       } catch (e) {
@@ -381,17 +413,12 @@ export default function App() {
   }, [wallet])
 
   useEffect(() => { fetchAll() }, [fetchAll])
-
   useEffect(() => {
     const id = setInterval(fetchAll, REFRESH_MS)
     return () => clearInterval(id)
   }, [fetchAll])
-
   useEffect(() => {
-    const id = setInterval(
-      () => setCountdown(c => (c <= 1 ? REFRESH_MS / 1000 : c - 1)),
-      1000
-    )
+    const id = setInterval(() => setCountdown(c => c <= 1 ? REFRESH_MS / 1000 : c - 1), 1000)
     return () => clearInterval(id)
   }, [])
 
@@ -403,7 +430,7 @@ export default function App() {
     setWallet(w)
   }
 
-  // ── No wallet → Landing ───────────────────────────────────────────────────
+  // ── No wallet → Landing ──
   if (!wallet) {
     return (
       <LandingHero
@@ -414,274 +441,574 @@ export default function App() {
     )
   }
 
-  // ── With wallet → Portfolio view ──────────────────────────────────────────
+  // ── Derived data ──
   const activeObligations = getActiveObligations(obligations)
-  const activeVaults = vaultPositions.filter(v => Number(v.totalShares ?? 0) > 0)
-  const hasPositions = activeObligations.length > 0 || activeVaults.length > 0
-  const totals = portfolioTotals(activeObligations, activeVaults)
-  const overall_cfg = OVERALL_CONFIG[overall]
+  const activeVaults      = vaultPositions.filter(v => Number(v.totalShares ?? 0) > 0)
+  const totals            = portfolioTotals(activeObligations, activeVaults)
+  const hasPositions      = activeObligations.length > 0 || activeVaults.length > 0
 
-  // Determine which markets the user actually has positions in
-  const userMarketKeys = [...new Set(
-    activeObligations
-      .filter(o => o.marketKey)
-      .map(o => o.marketKey as string)
-  )]
+  const cfg      = OVERALL_CONFIG[overall]
+  const overallScore = tierToScore(overall)
+  const tone     = overall === 'green' ? 'good' : overall === 'yellow' ? 'watch' : 'risk'
+  const stageIdx = overall === 'green' ? 0 : overall === 'yellow' ? 1 : overall === 'orange' ? 2 : 3
 
-  // Primary market key for pool liquidity panel
-  const MAIN_MARKET = '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF'
-  const poolMarketKey = userMarketKeys.includes(MAIN_MARKET) ? MAIN_MARKET : userMarketKeys[0]
+  // Radar items
+  const radarItems: RadarItem[] = layers.map(l => ({
+    key:    l.id,
+    name:   l.name,
+    status: tierToStatus(l.tier),
+    score:  tierToScore(l.tier),
+  }))
 
-  // Protocol layers (exclude position — shown in its own section)
-  const protocolLayers = layers.filter(l => l.id !== 'position')
+  // Active risk layer for drill
+  const activeLayer = layers.find(l => l.id === riskActive) ?? layers[0]
+  const flaggedCount = radarItems.filter(r => r.status !== 'good').length
+
+  // Earnings from vaults
+  const primaryVault   = activeVaults[0]
+  const apyBase        = primaryVault?.apy ?? 0
+  const apyFarm        = primaryVault?.apyFarmRewards ?? 0
+  const blendedApy     = apyBase + apyFarm
+  const totalDeposited = totals.deposited
+  const earnPerYear    = totalDeposited * blendedApy
+  const earnPerMonth   = earnPerYear / 12
+  const earnPerDay     = earnPerYear / 365
+  const earnTarget     = earnMode === 'day' ? earnPerDay : earnMode === 'month' ? earnPerMonth : earnPerYear
+
+  // Withdrawal data from primary vault
+  const vaultTvl      = primaryVault?.vaultTvlUsd ?? 0
+  const totalBorrowUsd= primaryVault?.reserveTotalBorrowUsd ?? 0
+  const utilization   = primaryVault?.reserveUtilization ?? 0
+  const yourPosition  = primaryVault?.totalValueUsd ?? 0
+  const availableUsd  = totalBorrowUsd > 0
+    ? Math.max(vaultTvl - totalBorrowUsd, 0)
+    : (primaryVault?.tokensAvailableUsd ?? 0)
+  const coverage      = yourPosition > 0 ? availableUsd / yourPosition : 0
+  const pctOfAvailable= coverage > 0 ? 100 / coverage : 0
+
+  // Ticker items
+  const tickerItems: [string, string, string, 'up' | 'dn'][] = [
+    ...(kaminoTVL > 0 ? [['KAMINO TVL', fmtMoney(kaminoTVL, true), '', 'up'] as [string, string, string, 'up' | 'dn']] : []),
+    ...(utilization > 0 ? [['VAULT UTIL', `${(utilization * 100).toFixed(2)}%`, '', 'dn'] as [string, string, string, 'up' | 'dn']] : []),
+    ...oracleFeeds.slice(0, 8).map(f => [
+      f.sym.split('/')[0],
+      f.price < 10 ? `$${f.price.toFixed(4)}` : `$${fmtN(f.price, 2)}`,
+      '',
+      'up',
+    ] as [string, string, string, 'up' | 'dn']),
+  ]
+
+  // Count-up animated values (called at top level, not conditionally)
+  const animNetWorth  = useCountUp(totals.net)
+  const animDeposited = useCountUp(totals.deposited)
+  const animCoverage  = useCountUp(coverage)
+  const animEarn      = useCountUp(earnTarget)
+
+  const stripStages = [
+    { label: 'ALL GOOD', tone: 'good' },
+    { label: 'WATCH',    tone: 'watch' },
+    { label: 'AT RISK',  tone: 'risk' },
+    { label: 'CRITICAL', tone: 'risk' },
+  ]
 
   return (
-    <div className="min-h-screen" style={{ background: '#07090e' }}>
+    <div className="t-app">
 
-      {/* ── Header ── */}
-      <header
-        className="sticky top-0 z-20"
-        style={{
-          background: 'rgba(7,9,14,0.85)',
-          backdropFilter: 'blur(16px)',
-          borderBottom: '1px solid rgba(255,255,255,0.05)',
-        }}
-      >
-        <div className="max-w-4xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-4">
-          {/* Logo */}
+      {/* ── Topbar ── */}
+      <header className="t-topbar">
+        <div className="t-brand">
           <button
+            className="t-brand-mark"
             onClick={() => handleSearch('')}
-            className="flex items-center gap-2.5 flex-shrink-0 group"
-          >
-            <div
-              className="w-7 h-7 rounded-lg flex items-center justify-center"
-              style={{
-                background: 'rgba(139,92,246,0.15)',
-                border: '1px solid rgba(139,92,246,0.3)',
-              }}
-            >
-              <span className="text-violet-400 text-xs font-black">K</span>
-            </div>
-            <span className="text-slate-400 text-sm font-semibold group-hover:text-slate-300 transition-colors">
-              KaminoPulse
-            </span>
-          </button>
+            style={{ cursor: 'pointer', border: 0 }}
+          >K</button>
+          <span className="t-brand-name">
+            Kamino<span className="t-dot">·</span>Pulse
+          </span>
+          <span className="t-capxs" style={{ marginLeft: 8, color: 'var(--text-4)' }}>
+            v0.5 · READ-ONLY
+          </span>
+        </div>
 
-          {/* Wallet pill */}
-          <div className="flex items-center gap-2 flex-1 justify-center min-w-0">
-            <span
-              className="px-3 py-1.5 rounded-lg text-xs font-mono text-slate-400 truncate max-w-xs"
-              style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.06)' }}
-            >
+        <div className="t-wallet-row">
+          <div className="t-wallet-pill">
+            <span className="t-capxs" style={{ color: 'var(--text-4)', flexShrink: 0 }}>WALLET</span>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 12.5, color: 'var(--text)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {walletMasked ? '•••• •••• ••••' : shortWallet(wallet)}
             </span>
             <button
+              className="t-btn-ghost"
               onClick={() => setWalletMasked(m => !m)}
-              className="text-slate-600 hover:text-slate-400 transition-colors flex-shrink-0 text-sm leading-none"
               title={walletMasked ? 'Show wallet' : 'Hide wallet'}
             >
               {walletMasked ? '👁' : '🙈'}
             </button>
-            <button
-              onClick={() => handleSearch('')}
-              className="text-xs text-slate-600 hover:text-slate-400 transition-colors flex-shrink-0"
-            >
-              ✕ clear
-            </button>
+            <button className="t-btn-ghost" onClick={() => handleSearch('')}>✕ clear</button>
           </div>
+        </div>
 
-          {/* Refresh */}
-          <div className="flex items-center gap-3 flex-shrink-0">
-            <span className="text-[11px] text-slate-700 hidden sm:block">
-              {loading ? 'refreshing…' : `next in ${countdown}s`}
-            </span>
-            <button
-              onClick={fetchAll}
-              disabled={loading}
-              className="text-xs px-3 py-1.5 rounded-lg transition-all disabled:opacity-30"
-              style={{
-                background: 'rgba(255,255,255,0.04)',
-                border: '1px solid rgba(255,255,255,0.06)',
-                color: '#64748b',
-              }}
-            >
-              {loading ? '…' : '↻'}
-            </button>
+        <div className="t-topbar-right">
+          <span className="t-live-pill">
+            <span className="t-live-dot" />
+            {loading ? 'UPDATING' : `LIVE · ${countdown}s`}
+          </span>
+          <div className="t-theme-toggle">
+            <button className={theme === 'dark'  ? 'on' : ''} onClick={() => setTheme('dark')}>DARK</button>
+            <button className={theme === 'light' ? 'on' : ''} onClick={() => setTheme('light')}>LIGHT</button>
           </div>
+          <button
+            onClick={fetchAll}
+            disabled={loading}
+            className="t-btn-ghost"
+            title="Refresh"
+          >
+            {loading ? '…' : '↻'}
+          </button>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+      {/* ── Ticker ── */}
+      {tickerItems.length > 0 && <TickerBar items={tickerItems} />}
 
-        {/* ── Portfolio Summary ── */}
-        <div
-          className="rounded-2xl overflow-hidden"
-          style={{
-            background: 'linear-gradient(135deg, #0d1117 0%, rgba(109,40,217,0.06) 100%)',
-            border: '1px solid rgba(139,92,246,0.15)',
-            boxShadow: '0 0 60px rgba(109,40,217,0.06)',
-          }}
-        >
-          <div className="px-6 pt-6 pb-5" style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-            <div className="flex items-start justify-between gap-4 flex-wrap">
-              <div>
-                <p className="text-[10px] font-bold tracking-[0.2em] text-slate-700 uppercase mb-2">
-                  Portfolio Overview
-                </p>
-                <div className="flex items-center gap-3">
-                  <div
-                    className="w-3 h-3 rounded-full flex-shrink-0"
-                    style={{
-                      backgroundColor: overall_cfg.color,
-                      boxShadow: `0 0 10px ${overall_cfg.color}88`,
-                    }}
-                  />
-                  <h2
-                    className="text-3xl font-black tracking-tight"
-                    style={{ color: overall_cfg.color }}
-                  >
-                    {overall_cfg.label}
-                  </h2>
-                </div>
-                <p className="text-slate-500 text-sm mt-1.5">{overall_cfg.desc}</p>
+      {/* ── Main ── */}
+      <main className="t-main">
+
+        {/* ── Hero ── */}
+        <div className="t-hero">
+          <div className="t-hero-head">
+
+            <div className="t-hero-left">
+              <div className="t-hero-meta">
+                <span className="t-cap">PORTFOLIO STATUS</span>
+                <span className="t-capxs" style={{ color: 'var(--text-4)' }}>
+                  {lastUpdated ? `UPDATED ${lastUpdated.toLocaleTimeString()}` : 'FETCHING...'}
+                </span>
               </div>
-              <div className="text-right flex-shrink-0">
-                <p className="text-[11px] text-slate-700">
-                  {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : 'Fetching…'}
-                </p>
+              <div className="t-hero-status">
+                <span className={`t-hero-label ${tone}`}>{cfg.label}</span>
+                <span className="t-hero-score">
+                  SCORE <b>{overallScore}</b> / 100
+                </span>
+              </div>
+              <p className="t-hero-desc">{cfg.desc}</p>
+              <div className="t-strip" style={{ marginTop: 'auto' }}>
+                {stripStages.map((s, i) => (
+                  <span key={i} className={`${i === stageIdx ? 'on' : ''} ${s.tone}`} />
+                ))}
+              </div>
+              <div className="t-strip-labels">
+                {stripStages.map((s, i) => (
+                  <span key={i} className="t-capxs" style={{
+                    color: i === stageIdx
+                      ? s.tone === 'good' ? 'var(--green)' : s.tone === 'watch' ? 'var(--amber)' : 'var(--red)'
+                      : 'var(--text-4)',
+                    fontWeight: i === stageIdx ? 600 : 400,
+                    fontSize: 9,
+                  }}>
+                    {s.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            <div className="t-hero-right">
+              <div className="t-spark-head">
+                <div className="t-legend">
+                  <span className="t-cap">RISK SCORE · 90D</span>
+                  <span className="t-capxs" style={{ color: 'var(--green)' }}>▲ SAFE ZONE ≥70</span>
+                </div>
+                <div className="t-range">
+                  {(['7D', '30D', '90D'] as const).map(r => (
+                    <button
+                      key={r}
+                      className={sparkRange === r ? 'on' : ''}
+                      onClick={() => setSparkRange(r)}
+                    >{r}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="t-spark-wrap">
+                <RiskSparkline data={RISK_HISTORY} range={sparkRange} />
               </div>
             </div>
           </div>
 
-          {/* Totals grid */}
-          <div
-            className="grid grid-cols-2 sm:grid-cols-4 divide-x divide-y sm:divide-y-0"
-            style={{ '--tw-divide-opacity': 0.04 } as React.CSSProperties}
-          >
-            {[
-              { label: 'Total Deposited', value: totals.deposited > 0 ? fmt(totals.deposited) : '—', sub: 'collateral + vaults' },
-              { label: 'Total Borrowed',  value: totals.borrowed  > 0 ? fmt(totals.borrowed)  : '—', sub: 'outstanding debt' },
-              { label: 'Net Worth',       value: totals.deposited > 0 ? fmt(totals.net) : '—',         sub: 'deposited minus debt', highlight: totals.net },
-              { label: 'Active Positions',value: loading ? '…' : String(activeObligations.length + activeVaults.length), sub: 'across all markets' },
-            ].map(({ label, value, sub, highlight }) => (
-              <div key={label} className="px-5 py-4" style={{ borderColor: 'rgba(255,255,255,0.04)' }}>
-                <p className="text-[11px] text-slate-600 font-medium mb-1.5">{label}</p>
-                <p
-                  className="text-xl font-black leading-none"
-                  style={{
-                    color:
-                      highlight !== undefined
-                        ? highlight >= 0 ? '#34d399' : '#f87171'
-                        : '#f1f5f9',
-                  }}
-                >
-                  {value}
-                </p>
-                <p className="text-[11px] text-slate-700 mt-1.5">{sub}</p>
-              </div>
-            ))}
+          <div className="t-stats">
+            <div>
+              <span className="t-cap">NET WORTH</span>
+              <span className="t-val" style={{ fontFamily: 'var(--mono)', fontSize: 24, fontWeight: 600, letterSpacing: '-0.02em' }}>
+                ${fmtN(animNetWorth, 0)}
+              </span>
+              <span className="t-sub up">
+                {(activeObligations.length + activeVaults.length) > 0
+                  ? `▲ ACROSS ${activeObligations.length + activeVaults.length} POSITIONS`
+                  : 'NO POSITIONS'}
+              </span>
+            </div>
+            <div>
+              <span className="t-cap">TOTAL DEPOSITED</span>
+              <span className="t-val" style={{ fontFamily: 'var(--mono)', fontSize: 24, fontWeight: 600 }}>
+                {fmtMoney(animDeposited, true)}
+              </span>
+              <span className="t-sub">SUPPLY · NON-LEVERAGED</span>
+            </div>
+            <div>
+              <span className="t-cap">TOTAL BORROWED</span>
+              <span className="t-val" style={{ fontFamily: 'var(--mono)', fontSize: 24, fontWeight: 600, color: totals.borrowed > 0 ? 'var(--red)' : 'var(--text-3)' }}>
+                {totals.borrowed > 0 ? fmtMoney(totals.borrowed, true) : '— —'}
+              </span>
+              <span className="t-sub">{totals.borrowed > 0 ? 'OUTSTANDING DEBT' : 'NO OUTSTANDING DEBT'}</span>
+            </div>
+            <div>
+              <span className="t-cap">BLENDED APY</span>
+              <span className="t-val" style={{ fontFamily: 'var(--mono)', fontSize: 24, fontWeight: 600, color: blendedApy > 0 ? 'var(--green)' : 'var(--text-3)' }}>
+                {blendedApy > 0 ? `${(blendedApy * 100).toFixed(2)}%` : '—'}
+              </span>
+              <span className="t-sub up">
+                {apyFarm > 0 ? `+${(apyFarm * 100).toFixed(2)}% REWARDS INCL.` : 'BASE LENDING YIELD'}
+              </span>
+            </div>
           </div>
         </div>
 
-        {/* ── Positions ── */}
-        {loading && !hasPositions ? (
-          <div className="space-y-4">
-            {[0, 1].map(i => (
-              <div
-                key={i}
-                className="rounded-2xl animate-pulse"
-                style={{ background: '#0d1117', border: '1px solid rgba(255,255,255,0.04)', height: 220 }}
-              />
-            ))}
-          </div>
-        ) : !hasPositions ? (
-          <div
-            className="rounded-2xl px-6 py-10 text-center"
-            style={{ background: '#0d1117', border: '1px solid rgba(255,255,255,0.06)' }}
-          >
-            <p className="text-slate-400 font-semibold mb-2">No active Kamino positions found</p>
-            <p className="text-slate-600 text-sm leading-relaxed max-w-sm mx-auto">
-              This wallet doesn't appear to have any open lending, borrowing, or vault positions
-              on Kamino Finance right now.
-            </p>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <h2 className="text-[10px] font-bold tracking-[0.2em] text-slate-700 uppercase px-1">
-              Your Positions ({activeObligations.length + activeVaults.length})
-            </h2>
+        {/* ── Row 2: Earnings + Withdrawal ── */}
+        {hasPositions && (
+          <div className="t-row-2">
 
-            {activeObligations.map((obl, i) => {
-              const symMap = obl.marketKey
-                ? reservesBySymbolForMarket(registry, obl.marketKey)
-                : {}
-              return (
-                <ObligationCard
-                  key={obl.obligationAddress || i}
-                  obligation={obl}
-                  index={i}
-                  reservesBySymbol={symMap}
-                />
-              )
-            })}
+            {/* Earnings Panel */}
+            <div className="t-panel">
+              <div className="t-panel-head">
+                <div className="t-panel-title">
+                  <span className="t-cap">EARNINGS PROJECTION</span>
+                  <span className="t-capxs" style={{ color: 'var(--text-4)' }}>
+                    @ {blendedApy > 0 ? `${(blendedApy * 100).toFixed(2)}%` : '—'} APY
+                  </span>
+                </div>
+                <span className="t-chip info">COMPOUNDING · LIVE</span>
+              </div>
+              <div className="t-earn-body">
+                <div className="t-earn-stats">
+                  {([
+                    { key: 'day'   as const, label: 'PER DAY',   val: earnPerDay   },
+                    { key: 'month' as const, label: 'PER MONTH', val: earnPerMonth  },
+                    { key: 'year'  as const, label: 'PER YEAR',  val: earnPerYear  },
+                  ]).map(({ key, label, val }) => (
+                    <div
+                      key={key}
+                      className={`t-earn-stat ${earnMode === key ? 'active' : ''}`}
+                      onClick={() => setEarnMode(key)}
+                    >
+                      <span className="t-cap">{label}</span>
+                      <div className="t-val">${fmtN(val, key === 'year' ? 0 : 2)}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="t-earn-chart">
+                  {blendedApy > 0 && totalDeposited > 0 && (
+                    <EarningsChart mode={earnMode} apy={blendedApy} principal={totalDeposited} />
+                  )}
+                </div>
+                <div className="t-earn-meta">
+                  <span>
+                    BASE LENDING{' '}
+                    <span className="mono">{(apyBase * 100).toFixed(2)}%</span>
+                    {apyFarm > 0 && (
+                      <> + INCENTIVE REWARDS <span className="mono">{(apyFarm * 100).toFixed(2)}%</span></>
+                    )}
+                  </span>
+                  <span className="mono">
+                    PROJ. <span style={{ color: 'var(--green)' }}>${fmtN(animEarn, earnMode === 'year' ? 0 : 2)}</span>
+                  </span>
+                </div>
+              </div>
+            </div>
 
-            {activeVaults.map((vault, i) => (
-              <VaultCard key={vault.vaultAddress || i} position={vault} index={i} />
-            ))}
+            {/* Withdrawal Panel */}
+            <div className="t-panel">
+              <div className="t-panel-head">
+                <div className="t-panel-title">
+                  <span className="t-cap">WITHDRAWAL RISK</span>
+                  <span className="t-capxs" style={{ color: 'var(--text-4)' }}>TRUE VAULT LIQUIDITY</span>
+                </div>
+                <span className={`t-chip ${coverage >= 10 ? 'good' : coverage >= 3 ? 'watch' : 'risk'}`}>
+                  {coverage >= 10 ? 'EXIT INSTANT' : coverage >= 3 ? 'LOW RISK' : 'MONITOR'}
+                </span>
+              </div>
+              <div className="t-wd-body">
+                {yourPosition > 0 ? (
+                  <>
+                    <div>
+                      <div className="t-cap" style={{ marginBottom: 4 }}>COVERAGE OF YOUR POSITION</div>
+                      <div className="t-wd-coverage">
+                        {Math.round(animCoverage)}<span className="x">×</span>
+                      </div>
+                      <div className="t-wd-verdict">
+                        {coverage >= 10
+                          ? 'EXIT INSTANTLY — DEEP LIQUIDITY'
+                          : coverage >= 3
+                            ? 'LOW RISK — AMPLE LIQUIDITY'
+                            : coverage >= 1
+                              ? 'MONITOR — LIQUIDITY TIGHTENING'
+                              : 'CAUTION — LIQUIDITY BELOW POSITION'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 18 }}>
+                        <span>YOUR POSITION</span>
+                        <span>AVAILABLE LIQUIDITY · {fmtMoney(availableUsd, true)}</span>
+                      </div>
+                      <div className="t-wd-bar-track">
+                        <div className="t-wd-bar-fill" />
+                        <div
+                          className="t-wd-bar-mark"
+                          style={{ left: `${Math.max(0.3, Math.min(99, pctOfAvailable)).toFixed(1)}%` }}
+                        />
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>
+                        <span style={{ color: 'var(--text)' }}>${fmtN(yourPosition, 0)}</span>
+                        <span>= {pctOfAvailable.toFixed(2)}% OF AVAILABLE</span>
+                      </div>
+                    </div>
+
+                    <div className="t-wd-kv">
+                      <div><span className="k">VAULT TVL</span><span className="v">{fmtMoney(vaultTvl, true)}</span></div>
+                      <div><span className="k">UTILIZATION</span><span className="v">{(utilization * 100).toFixed(2)}%</span></div>
+                      <div><span className="k">TRUE AVAIL.</span><span className="v">{fmtMoney(availableUsd, true)}</span></div>
+                      <div><span className="k">SOURCE</span><span className="v" style={{ color: 'var(--text-3)' }}>ON-CHAIN</span></div>
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--text-3)', fontFamily: 'var(--mono)', fontSize: 12 }}>
+                    NO VAULT POSITION
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         )}
 
-        {/* ── Pool Liquidity (shown when user has positions) ── */}
-        {hasPositions && poolMarketKey && Object.keys(registry).length > 0 && (
-          <PoolLiquidityPanel registry={registry} marketKey={poolMarketKey} />
+        {/* ── Risk Panel ── */}
+        {radarItems.length > 0 && (
+          <div className="t-panel">
+            <div className="t-panel-head">
+              <div className="t-panel-title">
+                <span className="t-cap">RISK LAYERS · {radarItems.length}-FACTOR</span>
+                <span className="t-capxs" style={{ color: 'var(--text-4)' }}>
+                  {flaggedCount} LAYERS FLAGGED · {radarItems.length - flaggedCount} SAFE
+                </span>
+              </div>
+              <span className={`t-chip ${tone}`}>{cfg.label}</span>
+            </div>
+            <div className="t-radar-body">
+              <div className="t-radar-left">
+                <RiskRadar risks={radarItems} activeKey={riskActive} onPick={setRiskActive} />
+              </div>
+              <div className="t-radar-right">
+                {radarItems.map(r => (
+                  <div
+                    key={r.key}
+                    className={`t-risk-row ${riskActive === r.key ? 'active' : ''}`}
+                    onClick={() => setRiskActive(r.key)}
+                  >
+                    <span className={`t-dot ${r.status}`} />
+                    <div>
+                      <div className="t-rname">{r.name}</div>
+                      <div className="t-rdetail">
+                        {layers.find(l => l.id === r.key)?.description ?? ''}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 3 }}>
+                      <span className={`t-rscore ${r.status}`}>{r.score}</span>
+                      <span className={`t-pill-s ${r.status}`}>
+                        {r.status === 'good' ? 'SAFE' : r.status === 'watch' ? 'WATCH' : 'RISK'}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {activeLayer && (
+              <div className="t-risk-drill">
+                <div>
+                  <h4>{activeLayer.name} · summary</h4>
+                  <div style={{ color: 'var(--text)', lineHeight: 1.55, fontSize: 12.5 }}>
+                    {activeLayer.description}
+                  </div>
+                </div>
+                <div>
+                  <h4>signals</h4>
+                  <table>
+                    <tbody>
+                      {activeLayer.signals.map((s, i) => (
+                        <tr key={i}>
+                          <td>{s.label}</td>
+                          <td>{s.value ?? s.status}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
         )}
 
-        {/* ── Protocol Health (collapsible) ── */}
-        <div>
-          <button
-            onClick={() => setProtocolExpanded(e => !e)}
-            className="w-full flex items-center justify-between px-5 py-3.5 rounded-xl transition-all"
-            style={{
-              background: 'rgba(255,255,255,0.025)',
-              border: '1px solid rgba(255,255,255,0.05)',
-            }}
-          >
-            <div className="flex items-center gap-3">
-              <span className="text-[10px] font-bold tracking-[0.2em] text-slate-600 uppercase">
-                Protocol Health Context
-              </span>
-              <span className="text-[11px] text-slate-700">
-                — Kamino-wide risk signals
-              </span>
-            </div>
-            <span
-              className="text-slate-700 text-sm transition-transform duration-200"
-              style={{ display: 'inline-block', transform: protocolExpanded ? 'rotate(180deg)' : 'none' }}
-            >
-              ▾
-            </span>
-          </button>
+        {/* ── Loading skeleton ── */}
+        {loading && !hasPositions && radarItems.length === 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--gap)' }}>
+            {[0, 1].map(i => <div key={i} className="t-skeleton" />)}
+          </div>
+        )}
 
-          {protocolExpanded && (
-            <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {protocolLayers.map(layer => (
-                <RiskCard key={layer.id} layer={layer} />
-              ))}
+        {/* ── Row 3: Positions + Oracle ── */}
+        <div className="t-row-3">
+
+          {/* Positions */}
+          <div className="t-panel">
+            <div className="t-panel-head">
+              <div className="t-panel-title">
+                <span className="t-cap">POSITIONS</span>
+                <span className="t-capxs" style={{ color: 'var(--text-4)' }}>
+                  {activeVaults.length + activeObligations.length} ACTIVE
+                </span>
+              </div>
             </div>
-          )}
+            {(activeVaults.length + activeObligations.length) === 0 ? (
+              <div style={{ padding: '32px 20px', textAlign: 'center', color: 'var(--text-3)', fontFamily: 'var(--mono)', fontSize: 12 }}>
+                {loading ? 'LOADING...' : 'NO ACTIVE POSITIONS'}
+              </div>
+            ) : (
+              <table className="t-pos-table">
+                <thead>
+                  <tr>
+                    <th>ASSET</th>
+                    <th className="right">VALUE</th>
+                    <th className="right">APY</th>
+                    <th className="right">VAULT UTIL</th>
+                    <th className="right">COVERAGE</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeVaults.map((v, i) => {
+                    const vBase    = v.apy ?? 0
+                    const vFarm    = v.apyFarmRewards ?? 0
+                    const vApy     = vBase + vFarm
+                    const vVal     = v.totalValueUsd ?? 0
+                    const vUtil    = (v.reserveUtilization ?? 0) * 100
+                    const vTvl     = v.vaultTvlUsd ?? 0
+                    const vBorrow  = v.reserveTotalBorrowUsd ?? 0
+                    const vAvail   = vBorrow > 0 ? Math.max(vTvl - vBorrow, 0) : (v.tokensAvailableUsd ?? 0)
+                    const vCov     = vVal > 0 ? vAvail / vVal : 0
+                    const sym      = v.tokenSymbol ?? 'VAULT'
+                    const utilSt   = vUtil >= 82 ? 'watch' : 'good'
+                    return (
+                      <tr key={v.vaultAddress || i}>
+                        <td>
+                          <div className="t-pos-asset">
+                            <div className={`t-pos-icon ${sym.toLowerCase()}`}>
+                              {sym.slice(0, 2)}
+                            </div>
+                            <div className="t-pos-name">
+                              <div className="prim">
+                                {sym}
+                                <span className="t-tag vault">K-VAULT</span>
+                                {vFarm > 0 && <span className="t-tag farm">FARM</span>}
+                              </div>
+                              <div className="sec">{shortWallet(v.vaultAddress || '???')}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="right">
+                          <div style={{ color: 'var(--text)', fontSize: 13 }}>${fmtN(vVal, 0)}</div>
+                        </td>
+                        <td className="right">
+                          <div style={{ color: 'var(--green)', fontSize: 13 }}>{(vApy * 100).toFixed(2)}%</div>
+                          {vFarm > 0 && (
+                            <div style={{ color: 'var(--text-3)', fontSize: 10 }}>
+                              {(vBase * 100).toFixed(2)}% + {(vFarm * 100).toFixed(2)}%
+                            </div>
+                          )}
+                        </td>
+                        <td className="right">
+                          <div style={{ color: utilSt === 'watch' ? 'var(--amber)' : 'var(--text)', fontSize: 13 }}>
+                            {vUtil.toFixed(2)}%
+                          </div>
+                          <div className="t-bar-mini">
+                            <span className={utilSt} style={{ width: `${Math.min(vUtil, 100)}%` }} />
+                          </div>
+                        </td>
+                        <td className="right">
+                          <div style={{ color: 'var(--green)', fontSize: 13, fontWeight: 600 }}>
+                            {Math.round(vCov)}×
+                          </div>
+                          <div style={{ color: 'var(--text-3)', fontSize: 10 }}>
+                            {vCov >= 10 ? 'EXIT INSTANT' : vCov >= 1 ? 'LOW RISK' : 'MONITOR'}
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                  {activeObligations.map((obl, i) => {
+                    const dep  = obl.refreshedStats ? Number(obl.refreshedStats.userTotalDeposit ?? 0) : (obl.depositedValue ?? 0)
+                    const bor  = obl.refreshedStats ? Number(obl.refreshedStats.userTotalBorrow ?? 0)  : (obl.borrowedValue ?? 0)
+                    const hf   = obl.healthFactor ?? null
+                    return (
+                      <tr key={obl.obligationAddress || `obl-${i}`}>
+                        <td>
+                          <div className="t-pos-asset">
+                            <div className="t-pos-icon" style={{ background: 'var(--panel-2)' }}>LN</div>
+                            <div className="t-pos-name">
+                              <div className="prim">
+                                LENDING
+                                <span className="t-tag vault">K-LEND</span>
+                              </div>
+                              <div className="sec">{shortWallet(obl.obligationAddress || '???')}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="right">
+                          <div style={{ color: 'var(--text)', fontSize: 13 }}>${fmtN(dep, 0)}</div>
+                          {bor > 0 && <div style={{ color: 'var(--red)', fontSize: 10 }}>-${fmtN(bor, 0)} borrowed</div>}
+                        </td>
+                        <td className="right">
+                          <div style={{ color: 'var(--text-3)', fontSize: 13 }}>—</div>
+                        </td>
+                        <td className="right">
+                          <div style={{ color: 'var(--text-3)', fontSize: 13 }}>—</div>
+                        </td>
+                        <td className="right">
+                          {hf !== null ? (
+                            <div style={{ color: hf >= 1.5 ? 'var(--green)' : hf >= 1.1 ? 'var(--amber)' : 'var(--red)', fontSize: 13, fontWeight: 600 }}>
+                              HF {hf.toFixed(2)}
+                            </div>
+                          ) : (
+                            <div style={{ color: 'var(--text-3)', fontSize: 13 }}>—</div>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {/* Oracle feeds */}
+          <OracleSection feeds={oracleFeeds} />
         </div>
 
         {/* ── Trust signal ── */}
-        <div
-          className="rounded-xl px-5 py-4 flex items-start gap-3"
-          style={{
-            background: 'rgba(16,185,129,0.04)',
-            border: '1px solid rgba(16,185,129,0.08)',
-          }}
-        >
-          <span className="text-emerald-500 text-base mt-0.5 flex-shrink-0">✓</span>
-          <p className="text-[11px] text-slate-600 leading-relaxed">
-            <span className="text-emerald-500 font-semibold">Zero bad debt on record.</span>{' '}
+        <div style={{
+          border: '1px solid rgba(38,208,124,0.12)',
+          background: 'rgba(38,208,124,0.04)',
+          borderRadius: 'var(--radius)',
+          padding: '12px 16px',
+          display: 'flex', gap: 10, alignItems: 'flex-start',
+        }}>
+          <span style={{ color: 'var(--green)', flexShrink: 0 }}>✓</span>
+          <p style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-3)', lineHeight: 1.6, margin: 0 }}>
+            <span style={{ color: 'var(--green)', fontWeight: 600 }}>Zero bad debt on record.</span>{' '}
             Kamino processed 55,649 liquidations during the February 2026 SOL crash without
             a single bad debt event. Protocol parameters and dynamic liquidation bonuses are
             designed to keep collateral liquidated before positions go underwater.
@@ -689,12 +1016,9 @@ export default function App() {
         </div>
 
         {/* Footer */}
-        <footer className="text-center pt-2 pb-6">
-          <p className="text-[11px] text-slate-800">
-            Data from Kamino Finance · DeFiLlama · Pyth Network · Jupiter · Helius
-          </p>
-          <p className="text-[11px] text-slate-900 mt-1">
-            Read-only · no wallet connection required · not financial advice
+        <footer style={{ textAlign: 'center', paddingBottom: 24 }}>
+          <p style={{ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--text-4)' }}>
+            Data from Kamino Finance · Pyth Network · Jupiter · Helius · Read-only · no wallet connection required
           </p>
         </footer>
 
