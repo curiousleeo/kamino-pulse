@@ -226,6 +226,7 @@ export default function App() {
 
   const [protocolExpanded, setProtocolExpanded] = useState(false)
   const [registry, setRegistry] = useState<ReserveRegistry>({})
+  const [walletMasked, setWalletMasked] = useState(false)
 
   const fetchAll = useCallback(async () => {
     setLoading(true)
@@ -472,8 +473,15 @@ export default function App() {
               className="px-3 py-1.5 rounded-lg text-xs font-mono text-slate-400 truncate max-w-xs"
               style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.06)' }}
             >
-              {shortWallet(wallet)}
+              {walletMasked ? '•••• •••• ••••' : shortWallet(wallet)}
             </span>
+            <button
+              onClick={() => setWalletMasked(m => !m)}
+              className="text-slate-600 hover:text-slate-400 transition-colors flex-shrink-0 text-sm leading-none"
+              title={walletMasked ? 'Show wallet' : 'Hide wallet'}
+            >
+              {walletMasked ? '👁' : '🙈'}
+            </button>
             <button
               onClick={() => handleSearch('')}
               className="text-xs text-slate-600 hover:text-slate-400 transition-colors flex-shrink-0"
