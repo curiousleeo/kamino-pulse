@@ -115,8 +115,12 @@ export function scoreOracleRisk(p: {
   const signals: RiskSignal[] = []
 
   for (const feed of p.feeds) {
-    const staleStatus  = thresh(feed.ageSeconds, [[120, 'red'], [60, 'orange'], [30, 'yellow']])
-    const confStatus   = thresh(feed.confRatio,  [[0.01, 'red'], [0.005, 'orange'], [0.001, 'yellow']])
+    // Staleness: REST API polling means prices are routinely 60–120s old — that's
+    // normal latency, not a risk. Only flag genuinely stale feeds (5+ min = orange).
+    const staleStatus  = thresh(feed.ageSeconds, [[600, 'red'], [300, 'orange'], [120, 'yellow']])
+    // Confidence: Pyth conf intervals vary by asset liquidity. 2% is a real signal;
+    // sub-1% is normal market microstructure noise for most assets.
+    const confStatus   = thresh(feed.confRatio,  [[0.05, 'red'], [0.02, 'orange'], [0.005, 'yellow']])
 
     let devStatus: SignalStatus = 'green'
     let deviation = 0
@@ -437,15 +441,27 @@ export function computeOverall(layers: RiskLayer[]): RiskTier {
   // Orange/red positions are the user's headline risk — show it directly
   if (posTier === 'orange' || posTier === 'red') return posTier
 
-  // Green/yellow positions: context layers can bump by at most 1 tier
-  // (e.g., network congestion or high protocol utilization is worth noting,
-  //  but shouldn't make a lend-only user's dashboard say "AT RISK")
+  // Detect whether the user has any borrow exposure.
+  // Supply-only (vault/lend-only) users are not affected by oracle deviations,
+  // network congestion, or protocol-wide utilization in the same way borrowers are.
+  // For them, context layers can push the overall to yellow at most — never "AT RISK".
+  const hasBorrowExposure = positionLayer.signals.some(
+    s => s.label.startsWith('Health Factor')
+  )
+
   const tierOrder: RiskTier[] = ['green', 'yellow', 'orange', 'red']
   const posIdx = tierOrder.indexOf(posTier)
   const contextTiers = activeLayers.filter(l => l.id !== 'position').map(l => l.tier)
   const contextTier  = contextTiers.length > 0 ? worst(contextTiers) : 'green'
   const ctxIdx       = tierOrder.indexOf(contextTier)
-  // Allow bumping by at most 1 step above position tier
-  const finalIdx     = Math.max(posIdx, Math.min(posIdx + 1, ctxIdx))
+
+  if (!hasBorrowExposure) {
+    // Supply-only: context can push to yellow but never beyond
+    const finalIdx = Math.max(posIdx, Math.min(1, ctxIdx))
+    return tierOrder[finalIdx]
+  }
+
+  // Borrowers: context layers can bump by at most 1 tier above their position tier
+  const finalIdx = Math.max(posIdx, Math.min(posIdx + 1, ctxIdx))
   return tierOrder[finalIdx]
 }
